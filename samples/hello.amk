@@ -1,0 +1,41 @@
+{
+  "version": "1.0",
+  "name": "hello",
+  "actions": [
+    {
+      "id": "a1",
+      "name": "Function Entry",
+      "enabled": true,
+      "delay_ms": 0,
+      "kind": "FunctionEntry"
+    },
+    {
+      "id": "a2",
+      "name": "/* Demo script */",
+      "enabled": true,
+      "delay_ms": 0,
+      "kind": { "Comment": { "text": "Demo script" } }
+    },
+    {
+      "id": "a3",
+      "name": "Delay 400 ms",
+      "enabled": true,
+      "delay_ms": 0,
+      "kind": { "Delay": { "ms": 400 } }
+    },
+    {
+      "id": "a4",
+      "name": "Type greeting",
+      "enabled": true,
+      "delay_ms": 0,
+      "kind": { "TypeText": { "text": "Xin chao tu AMK", "interval_ms": 25 } }
+    },
+    {
+      "id": "a5",
+      "name": "End Function",
+      "enabled": true,
+      "delay_ms": 0,
+      "kind": "EndFunction"
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+Automatic Mouse and Keyboard
+============================
+Giao dien giong RobotSoft AMK — Anh / Viet.
+San pham: crate Rust (khong dung Python).
+
+BUILD
+-----
+Can:
+  - Rust (https://rustup.rs/)
+  - Windows: "Desktop development with C++" (Visual Studio Build Tools)
+    https://aka.ms/vs/17/release/vs_BuildTools.exe
+
+Double-click BUILD-RUST.bat
+hoac:
+  cargo build --release
+
+File: target\release\automatic-mouse-keyboard.exe
+
+CHAY
+----
+Double-click CHAY.bat
+hoac:
+  cargo run --release
+  target\release\automatic-mouse-keyboard.exe
+
+Khong UI:
+  automatic-mouse-keyboard.exe --run file.amk
+
+Phim tat / nut
+--------------
+RECORD / GHI     ghi chuot
+SMART CLICK      keo vung BAM, roi anh do.
+                 Khong khop thi KHONG click. Timeout 0 = do 1 lan, khong treo.
+PLAY / CHAY      phat lai  (F9)   tam dung Ctrl+P
+Ctrl+Z           hoan tac
+EN/VI            doi ngon ngu
+Toc do           o khung Play Options
+Nhap doi 1 dong  sua Smart Click / If / cua so / delay...
+Cua so           Activate / Close theo tieu de
+Lich             Tools → Scheduled Tasks (app phai con mo)
+Ghi              co ca lan chuot (wheel)
+
+File kich ban: .amk (JSON)  — samples\hello.amk
