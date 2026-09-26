@@ -1,8 +1,8 @@
 [package]
 name = "automatic-mouse-keyboard"
-version = "1.0.1"
+version = "0.3.0"
 edition = "2021"
-description = "Automatic Mouse and Keyboard — clone giao dien RobotSoft AMK (EN/VI)"
+description = "Record/play mouse and keyboard, Smart Click image search, script flow (EN/VI)"
 license = "MIT"
 
 [dependencies]
