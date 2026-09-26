@@ -11,6 +11,18 @@ fn default_on_fail() -> String {
 fn default_search_fail() -> String {
     "stop".into()
 }
+fn default_rnd_x() -> String {
+    "rnd_x".into()
+}
+fn default_rnd_y() -> String {
+    "rnd_y".into()
+}
+fn default_clip_name() -> String {
+    "clip".into()
+}
+fn default_wait_clip_timeout() -> u64 {
+    30_000
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MouseBtn {
@@ -131,6 +143,38 @@ pub enum ActionKind {
         a: i64,
         b: i64,
     },
+    /// Pick a random point in the rectangle and move the mouse there.
+    RandomMouse {
+        x1: i32,
+        y1: i32,
+        x2: i32,
+        y2: i32,
+        #[serde(default = "default_rnd_x")]
+        save_x: String,
+        #[serde(default = "default_rnd_y")]
+        save_y: String,
+    },
+    /// Read a value from a JSON file by dot path (`a.b.0.c`) into a variable.
+    ReadJson {
+        file: String,
+        query: String,
+        name: String,
+    },
+    /// Wait until the clipboard text changes, then store it in a variable.
+    WaitClipboard {
+        #[serde(default)]
+        exclude: String,
+        #[serde(default = "default_clip_name")]
+        save_name: String,
+        #[serde(default = "default_wait_clip_timeout")]
+        timeout_ms: u64,
+        #[serde(default = "default_search_fail")]
+        on_fail: String,
+    },
+    /// Play one random .amk script from a folder.
+    PlayRandom {
+        folder: String,
+    },
     Command {
         cmd: String,
     },
@@ -183,6 +227,14 @@ pub enum ActionKind {
     EndWhile,
     Break,
     Continue,
+    Switch {
+        expr: String,
+    },
+    Case {
+        value: String,
+    },
+    DefaultCase,
+    EndSwitch,
     Label {
         name: String,
     },
@@ -240,6 +292,14 @@ impl ActionKind {
             ActionKind::EndWhile => "act_endwhile",
             ActionKind::Break => "act_break",
             ActionKind::Continue => "act_continue",
+            ActionKind::Switch { .. } => "act_switch",
+            ActionKind::Case { .. } => "act_case",
+            ActionKind::DefaultCase => "act_case_default",
+            ActionKind::EndSwitch => "act_endswitch",
+            ActionKind::RandomMouse { .. } => "act_random_mouse",
+            ActionKind::ReadJson { .. } => "act_read_json",
+            ActionKind::WaitClipboard { .. } => "act_wait_clip",
+            ActionKind::PlayRandom { .. } => "act_play_random",
             ActionKind::Label { .. } => "act_label",
             ActionKind::Goto { .. } => "act_goto",
             ActionKind::MessageBox { .. } => "act_msg",
@@ -369,6 +429,28 @@ impl ActionKind {
             ActionKind::EndWhile => ("End While".into(), "".into(), "".into()),
             ActionKind::Break => ("Break".into(), "".into(), "".into()),
             ActionKind::Continue => ("Continue".into(), "".into(), "".into()),
+            ActionKind::Switch { expr } => ("Switch".into(), expr.clone(), "".into()),
+            ActionKind::Case { value } => ("Case".into(), value.clone(), "".into()),
+            ActionKind::DefaultCase => ("Default".into(), "".into(), "".into()),
+            ActionKind::EndSwitch => ("End Switch".into(), "".into(), "".into()),
+            ActionKind::RandomMouse { x1, y1, x2, y2, .. } => (
+                "Random Mouse".into(),
+                format!("{},{} -> {},{}", x1, y1, x2, y2),
+                "".into(),
+            ),
+            ActionKind::ReadJson { file, query, .. } => {
+                ("Read JSON".into(), file.clone(), query.clone())
+            }
+            ActionKind::WaitClipboard {
+                save_name,
+                timeout_ms,
+                ..
+            } => (
+                "Wait Clipboard".into(),
+                save_name.clone(),
+                format!("Timeout: {} ms", timeout_ms),
+            ),
+            ActionKind::PlayRandom { folder } => ("Play Random".into(), folder.clone(), "".into()),
             ActionKind::Label { name } => ("Label".into(), name.clone(), "".into()),
             ActionKind::Goto { name } => ("Goto".into(), name.clone(), "".into()),
             ActionKind::MessageBox { text } => ("Message Box".into(), text.clone(), "".into()),
@@ -470,6 +552,18 @@ impl ActionKind {
             ActionKind::EndWhile => "End While".into(),
             ActionKind::Break => "Break".into(),
             ActionKind::Continue => "Continue".into(),
+            ActionKind::Switch { expr } => format!("Switch  ({})", expr),
+            ActionKind::Case { value } => format!("Case  {}", value),
+            ActionKind::DefaultCase => "Default".into(),
+            ActionKind::EndSwitch => "End Switch".into(),
+            ActionKind::RandomMouse { x1, y1, x2, y2, .. } => {
+                format!("Random Mouse  ({},{}) -> ({},{})", x1, y1, x2, y2)
+            }
+            ActionKind::ReadJson { file, query, .. } => format!("Read JSON  {} :: {}", file, query),
+            ActionKind::WaitClipboard { save_name, .. } => {
+                format!("Wait Clipboard  ->  {}", save_name)
+            }
+            ActionKind::PlayRandom { folder } => format!("Play Random  {}", folder),
             ActionKind::Label { name } => format!("Label  {}", name),
             ActionKind::Goto { name } => format!("Goto  {}", name),
             ActionKind::MessageBox { text } => format!("MessageBox  \"{}\"", text),
@@ -514,11 +608,13 @@ impl ActionKind {
             ActionKind::FunctionEntry
             | ActionKind::If { .. }
             | ActionKind::For { .. }
-            | ActionKind::While { .. } => 1,
+            | ActionKind::While { .. }
+            | ActionKind::Switch { .. } => 1,
             ActionKind::EndFunction
             | ActionKind::EndIf
             | ActionKind::EndFor
-            | ActionKind::EndWhile => -1,
+            | ActionKind::EndWhile
+            | ActionKind::EndSwitch => -1,
             ActionKind::Else => 0,
             _ => 0,
         }
@@ -527,7 +623,11 @@ impl ActionKind {
     pub fn is_structure_end(&self) -> bool {
         matches!(
             self,
-            ActionKind::EndFunction | ActionKind::EndIf | ActionKind::EndFor | ActionKind::EndWhile
+            ActionKind::EndFunction
+                | ActionKind::EndIf
+                | ActionKind::EndFor
+                | ActionKind::EndWhile
+                | ActionKind::EndSwitch
         )
     }
 }
@@ -987,6 +1087,73 @@ fn kind_from_python(kind: &str, p: &Value) -> ActionKind {
         },
         "break" => ActionKind::Break,
         "continue" => ActionKind::Continue,
+        "switch" => ActionKind::Switch {
+            expr: str_of(p, "expr"),
+        },
+        "case" => ActionKind::Case {
+            value: str_of(p, "value"),
+        },
+        "defaultcase" | "default" => ActionKind::DefaultCase,
+        "endswitch" => ActionKind::EndSwitch,
+        "randommouse" => ActionKind::RandomMouse {
+            x1: i32_of(p, "x1", 0),
+            y1: i32_of(p, "y1", 0),
+            x2: i32_of(p, "x2", 1920),
+            y2: i32_of(p, "y2", 1080),
+            save_x: {
+                let n = str_of(p, "save_x");
+                if n.is_empty() {
+                    default_rnd_x()
+                } else {
+                    n
+                }
+            },
+            save_y: {
+                let n = str_of(p, "save_y");
+                if n.is_empty() {
+                    default_rnd_y()
+                } else {
+                    n
+                }
+            },
+        },
+        "readjson" | "json" => ActionKind::ReadJson {
+            file: str_of(p, "file"),
+            query: str_of(p, "query"),
+            name: {
+                let n = str_of(p, "name");
+                if n.is_empty() {
+                    "json".into()
+                } else {
+                    n
+                }
+            },
+        },
+        "waitclipboard" | "waitclip" => {
+            let mut k = ActionKind::WaitClipboard {
+                exclude: str_of(p, "exclude"),
+                save_name: {
+                    let n = str_of(p, "save_name");
+                    if n.is_empty() {
+                        default_clip_name()
+                    } else {
+                        n
+                    }
+                },
+                timeout_ms: u64_of(p, "timeout", u64_of(p, "timeout_ms", 30_000)),
+                on_fail: "stop".into(),
+            };
+            if let ActionKind::WaitClipboard { on_fail, .. } = &mut k {
+                let f = str_of(p, "on_fail");
+                if !f.is_empty() {
+                    *on_fail = f;
+                }
+            }
+            k
+        }
+        "playrandom" => ActionKind::PlayRandom {
+            folder: str_of(p, "folder"),
+        },
         "setclip" | "setclipboard" => ActionKind::SetClipboard {
             text: str_of(p, "text"),
         },

@@ -11,9 +11,10 @@ Version **0.3.0**. English and Vietnamese UI. Aimed at RobotSoft AMK behavior �
 - Play, pause, repeat (once / N / duration / until stopped)
 - Mouse Move with an optional duration (glide like AMK, 0 = instant)
 - Smart Click and Search Picture (BMP). No match → no click. Full-virtual-screen search on multi-monitor setups
-- If / Else, For (honors `step`, including negative), While, **Break / Continue**, Label / Goto
+- If / Else, For (honors `step`, including negative), While, **Break / Continue**, **Switch / Case**, Label / Goto
 - Key Down / Key Up to compose press-and-hold
-- Set Clipboard / Get Clipboard (CF_UNICODETEXT)
+- Set Clipboard / Get Clipboard (CF_UNICODETEXT) / **Wait Clipboard** (blocks until the text changes)
+- **Random Mouse** position inside a rectangle; **Read JSON** by dot path into a variable; **Play Random Script** from a folder
 - Wait Window: block until a window title appears (timeout + on-fail behavior)
 - Wait until `HH:MM`: the current minute counts as arrived; a minute already passed is skipped
 - Random number stays inside the inclusive range
@@ -23,10 +24,11 @@ Version **0.3.0**. English and Vietnamese UI. Aimed at RobotSoft AMK behavior �
 - Scheduled tasks fire at `HH:MM` **while the app window is open**. Language, hotkeys, repeat, and tasks are restored next launch
 - Headless: `automatic-mouse-keyboard --run file.amk` (exit code 1 when the run fails; logs stream to stdout)
 - File → Write launcher (`.cmd`) next to the `.amk` (player exe must be on PATH)
+- File → **Compile to EXE**: copies the player executable and embeds the script after a marker — a single-file EXE that plays the script on start (no install needed)
 
 ## What this is not
 
-Driver-level input, transparent-pixel templates, background window ops, packing a standalone EXE, OCR, regex, clipboard monitoring (WaitClipboardText), registry, Invoke DLL / WinAPI, Switch/Case, custom windows, AutoHotkey embed.
+Driver-level input, transparent-pixel templates, background window ops, OCR, regex, Invoke DLL / WinAPI / COM, custom windows, AutoHotkey embed, database/Excel, multi-threading, exception handling.
 
 ## Build / run
 

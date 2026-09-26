@@ -3,8 +3,9 @@ Automatic Mouse and Keyboard 0.3.0
 Ghi / chạy chuột-phím, Smart Click tìm ảnh, luồng If/For/While/Goto.
 Giao diện Anh / Việt. Windows.
 
-Theo chuẩn RobotSoft AMK cho phần ghi/chạy/lập trình kịch bản.
-Chưa có: compile EXE độc lập, OCR, driver-level, background window, ….
+Theo chuẩn RobotSoft AMK cho phần ghi/chạy/lập trình kịch bản
+(đã có cả biên dịch EXE nhúng kịch bản). Chưa có: OCR, driver-level,
+background window, Invoke DLL/COM, ….
 
 BUILD
 -----
@@ -48,6 +49,14 @@ If / Else / For / While / Label / Goto
                  For tôn trọng step (kể cả step âm)
 Break/Continue   Break thoát vòng lặp đang chạy; Continue bỏ qua phần còn lại
                  của vòng hiện tại. Dùng ngoài vòng lặp chỉ bị ghi log.
+Switch/Case      Switch theo giá trị biến/biểu thức; Case khớp thì chạy,
+                 Default chạy khi không Case nào khớp.
+Random Mouse     chọn điểm ngẫu nhiên trong hình chữ nhật, rê chuột tới,
+                 lưu tọa độ vào 2 biến (rnd_x / rnd_y).
+Chờ clipboard    Wait Clipboard: dừng tới khi nội dung clipboard khác
+                 ban đầu (timeout + on_fail), lưu vào biến.
+Play Random      chạy ngẫu nhiên 1 file .amk trong thư mục.
+Read JSON        đọc giá trị từ tệp JSON theo đường dẫn a.b.0.c vào biến.
 Key Down/Up      giữ phím / nhả phím — ghép lại thành bấm-giữ bao lâu cũng được.
 Clipboard        Set Clipboard ghi text (có {biến}) vào clipboard;
                  Get Clipboard đọc clipboard vào một biến.
@@ -71,7 +80,9 @@ Lịch             Tools → Scheduled Tasks. Chạy đúng HH:MM khi app còn m
 Nhớ             Ngôn ngữ, phím tắt, tốc độ, cách lặp và lịch được lưu khi thoát
                  (%APPDATA%\AutomaticMouseKeyboard\session.json)
 Launcher         File → Write launcher (.cmd) — ghi file .cmd cạnh .amk,
-                 gọi --run. Cần .exe trên PATH. Không tạo EXE độc lập.
+                 gọi --run. Cần .exe trên PATH.
+Biên dịch EXE    File → Compile to EXE — sao chép player.exe và nhúng kịch
+                 bản vào trong: 1 file EXE độc lập, chạy là phát kịch bản.
 Tốc độ           khung Play Options
 
 File kịch bản: .amk (JSON)  — samples\hello.amk

@@ -12,6 +12,45 @@ mod vision;
 
 use eframe::egui;
 
+/// Marker between the copied executable image and the embedded script.
+pub(crate) const EMBED_MARKER: &[u8] = b"
+<<AMK-EMBED>>
+";
+
+/// Script JSON appended to a copied executable by "Compile to EXE".
+fn extract_embedded(bytes: &[u8]) -> Option<String> {
+    let pos = bytes
+        .windows(EMBED_MARKER.len())
+        .rposition(|w| w == EMBED_MARKER)?;
+    let rest = &bytes[pos + EMBED_MARKER.len()..];
+    if rest.is_empty() {
+        return None;
+    }
+    String::from_utf8(rest.to_vec()).ok()
+}
+
+/// Run one script headlessly with streamed logs; exit code 1 on failure.
+fn run_headless(script: model::Script, dir: Option<std::path::PathBuf>) -> ! {
+    let engine = engine::Engine::new();
+    engine.play(script, 2.5, 1, None, dir, false);
+    let mut printed = 0usize;
+    while engine.snapshot_state() != engine::RunState::Idle {
+        let logs = engine.logs();
+        while printed < logs.len() {
+            println!("{}  {}", logs[printed].time, logs[printed].text);
+            printed += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+    for line in engine.logs().iter().skip(printed) {
+        println!("{}  {}", line.time, line.text);
+    }
+    if !engine.last_run_ok() {
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(|s| s.as_str()) == Some("--run") {
@@ -22,26 +61,7 @@ fn main() -> eframe::Result<()> {
                     let dir = std::path::Path::new(&path)
                         .parent()
                         .map(|p| p.to_path_buf());
-                    let engine = engine::Engine::new();
-                    engine.play(script, 2.5, 1, None, dir, false);
-                    // Stream new log lines as they appear so a hung or slow
-                    // script is visible instead of silent until the end.
-                    let mut printed = 0usize;
-                    while engine.snapshot_state() != engine::RunState::Idle {
-                        let logs = engine.logs();
-                        while printed < logs.len() {
-                            println!("{}  {}", logs[printed].time, logs[printed].text);
-                            printed += 1;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(40));
-                    }
-                    for line in engine.logs().iter().skip(printed) {
-                        println!("{}  {}", line.time, line.text);
-                    }
-                    if !engine.last_run_ok() {
-                        std::process::exit(1);
-                    }
-                    return Ok(());
+                    run_headless(script, dir);
                 }
                 Err(e) => {
                     eprintln!("load {path}: {e}");
@@ -51,6 +71,20 @@ fn main() -> eframe::Result<()> {
             Err(e) => {
                 eprintln!("read {path}: {e}");
                 std::process::exit(1);
+            }
+        }
+    }
+    // A compiled single-file EXE carries its script after the marker.
+    if args.len() == 1 {
+        if let Ok(bytes) = std::fs::read(std::env::current_exe().unwrap_or_default()) {
+            if let Some(json) = extract_embedded(&bytes) {
+                match model::Script::load_json(&json) {
+                    Ok(script) => run_headless(script, None),
+                    Err(e) => {
+                        eprintln!("embedded script: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
         }
     }
@@ -174,6 +208,21 @@ fn apply_style(ctx: &egui::Context) {
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
     style.spacing.menu_margin = egui::Margin::same(6.0);
     ctx.set_style(style);
+}
+
+#[cfg(test)]
+mod embed_tests {
+    use super::*;
+
+    #[test]
+    fn extract_embedded_roundtrips_and_rejects_plain_executables() {
+        let script = r#"{"version":"1.0","name":"t","actions":[]}"#;
+        let mut bytes = b"MZ fake pe image".to_vec();
+        bytes.extend_from_slice(EMBED_MARKER);
+        bytes.extend_from_slice(script.as_bytes());
+        assert_eq!(extract_embedded(&bytes).as_deref(), Some(script));
+        assert_eq!(extract_embedded(b"MZ no marker"), None);
+    }
 }
 
 #[cfg(test)]

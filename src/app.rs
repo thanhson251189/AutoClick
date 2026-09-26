@@ -21,6 +21,9 @@ enum Dialog {
     File,
     Variable,
     Clipboard,
+    Switch,
+    Case,
+    Json,
     If,
     For,
     While,
@@ -670,8 +673,10 @@ impl AmkApp {
             ActionKind::MouseMove { .. }
             | ActionKind::MouseClick { .. }
             | ActionKind::MouseDrag { .. }
-            | ActionKind::MouseWheel { .. } => Dialog::Mouse,
+            | ActionKind::MouseWheel { .. }
+            | ActionKind::RandomMouse { .. } => Dialog::Mouse,
             ActionKind::TypeText { .. } | ActionKind::KeyPress { .. } => Dialog::Keyboard,
+            ActionKind::PlayRandom { .. } => Dialog::File,
             ActionKind::KeyDown { .. } | ActionKind::KeyUp { .. } => Dialog::Keyboard,
             ActionKind::Delay { .. } => Dialog::Delay,
             ActionKind::SmartClick { .. } => Dialog::Smart,
@@ -679,11 +684,16 @@ impl AmkApp {
             ActionKind::ActivateWindow { .. }
             | ActionKind::CloseWindow { .. }
             | ActionKind::WaitWindow { .. } => Dialog::Window,
-            ActionKind::SetClipboard { .. } | ActionKind::GetClipboard { .. } => Dialog::Clipboard,
+            ActionKind::SetClipboard { .. }
+            | ActionKind::GetClipboard { .. }
+            | ActionKind::WaitClipboard { .. } => Dialog::Clipboard,
             ActionKind::OpenFile { .. }
             | ActionKind::OpenUrl { .. }
             | ActionKind::OpenFolder { .. } => Dialog::File,
             ActionKind::SetVar { .. } => Dialog::Variable,
+            ActionKind::Switch { .. } => Dialog::Switch,
+            ActionKind::Case { .. } => Dialog::Case,
+            ActionKind::ReadJson { .. } => Dialog::Json,
             ActionKind::If { .. } => Dialog::If,
             ActionKind::For { .. } => Dialog::For,
             ActionKind::While { .. } => Dialog::While,
@@ -1037,6 +1047,42 @@ impl AmkApp {
         self.path = None; // Ctrl+S must not overwrite the previously opened file
         self.selected = Some(1);
         self.dirty = true;
+    }
+
+    /// Copy this executable next to the script and append the script after
+    /// the embed marker: a single-file EXE that runs it on start (AMK-style).
+    fn compile_exe(&mut self) {
+        if self.path.is_none() {
+            self.save_as();
+            if self.path.is_none() {
+                return;
+            }
+        }
+        let script_path = self.path.clone().unwrap();
+        self.save_to(script_path.clone());
+        if self.dirty {
+            return; // save failed
+        }
+        let fail = |s: &mut Self| s.status = t(s.lang, "exe_failed").to_string();
+        let Some(exe) = std::env::current_exe().ok().filter(|p| p.is_file()) else {
+            fail(self);
+            return;
+        };
+        let (Ok(bytes), Ok(json)) = (std::fs::read(&exe), self.script.to_json()) else {
+            fail(self);
+            return;
+        };
+        let mut out = bytes;
+        out.extend_from_slice(crate::EMBED_MARKER);
+        out.extend_from_slice(json.as_bytes());
+        let target = script_path.with_extension("exe");
+        if std::fs::write(&target, out).is_ok() {
+            self.status = t(self.lang, "exe_written")
+                .replace("{}", &target.display().to_string())
+                .to_string();
+        } else {
+            fail(self);
+        }
     }
 
     fn compile_launcher(&mut self) {
@@ -1403,6 +1449,10 @@ impl AmkApp {
                             ui.close_menu();
                         }
                         ui.separator();
+                        if ui.button(t(self.lang, "build_exe")).clicked() {
+                            self.compile_exe();
+                            ui.close_menu();
+                        }
                         if ui.button(t(self.lang, "compile_exe")).clicked() {
                             self.compile_launcher();
                             ui.close_menu();
@@ -1553,6 +1603,16 @@ impl AmkApp {
                             ]);
                             ui.close_menu();
                         }
+                        if ui.button(t(self.lang, "insert_switch")).clicked() {
+                            self.insert_block(vec![
+                                ActionKind::Switch { expr: "n".into() },
+                                ActionKind::Case { value: "1".into() },
+                                ActionKind::Case { value: "2".into() },
+                                ActionKind::DefaultCase,
+                                ActionKind::EndSwitch,
+                            ]);
+                            ui.close_menu();
+                        }
                         if ui.button(t(self.lang, "insert_break")).clicked() {
                             self.insert_kind(ActionKind::Break);
                             ui.close_menu();
@@ -1576,6 +1636,38 @@ impl AmkApp {
                             self.open_edit(
                                 ActionKind::SetClipboard {
                                     text: String::new(),
+                                },
+                                None,
+                            );
+                            ui.close_menu();
+                        }
+                        if ui.button(t(self.lang, "insert_wait_clip")).clicked() {
+                            self.open_edit(
+                                ActionKind::WaitClipboard {
+                                    exclude: String::new(),
+                                    save_name: "clip".into(),
+                                    timeout_ms: 30_000,
+                                    on_fail: "skip".into(),
+                                },
+                                None,
+                            );
+                            ui.close_menu();
+                        }
+                        if ui.button(t(self.lang, "insert_json")).clicked() {
+                            self.open_edit(
+                                ActionKind::ReadJson {
+                                    file: String::new(),
+                                    query: String::new(),
+                                    name: "json".into(),
+                                },
+                                None,
+                            );
+                            ui.close_menu();
+                        }
+                        if ui.button(t(self.lang, "insert_play_random")).clicked() {
+                            self.open_edit(
+                                ActionKind::PlayRandom {
+                                    folder: "scripts".into(),
                                 },
                                 None,
                             );
@@ -2287,14 +2379,21 @@ impl AmkApp {
                         | ActionKind::For { .. }
                         | ActionKind::While { .. }
                         | ActionKind::Break
-                        | ActionKind::Continue => "tb_if",
+                        | ActionKind::Continue
+                        | ActionKind::Switch { .. }
+                        | ActionKind::Case { .. }
+                        | ActionKind::DefaultCase
+                        | ActionKind::EndSwitch => "tb_if",
                         ActionKind::SetVar { .. }
                         | ActionKind::SetClipboard { .. }
-                        | ActionKind::GetClipboard { .. } => "tb_var",
+                        | ActionKind::GetClipboard { .. }
+                        | ActionKind::WaitClipboard { .. }
+                        | ActionKind::ReadJson { .. } => "tb_var",
                         ActionKind::FunctionEntry | ActionKind::CallFunction { .. } => "tb_fn",
                         ActionKind::ActivateWindow { .. }
                         | ActionKind::CloseWindow { .. }
                         | ActionKind::WaitWindow { .. } => "tb_win",
+                        ActionKind::PlayRandom { .. } | ActionKind::RandomMouse { .. } => "tb_more",
                         ActionKind::OpenFile { .. } => "tb_folder",
                         _ => "tb_more",
                     };
@@ -2855,6 +2954,9 @@ impl AmkApp {
             Dialog::File => t(self.lang, "dlg_file"),
             Dialog::Variable => t(self.lang, "insert_var"),
             Dialog::Clipboard => t(self.lang, "dlg_clip"),
+            Dialog::Switch => t(self.lang, "insert_switch"),
+            Dialog::Case => t(self.lang, "dlg_case"),
+            Dialog::Json => t(self.lang, "dlg_json"),
             Dialog::If => t(self.lang, "insert_if"),
             Dialog::For => t(self.lang, "insert_for"),
             Dialog::While => t(self.lang, "insert_while"),
@@ -2933,6 +3035,8 @@ impl AmkApp {
                     Dialog::Window => self.ui_window(ui),
                     Dialog::File => self.ui_file(ui),
                     Dialog::Clipboard => self.ui_clipboard(ui),
+                    Dialog::Switch | Dialog::Case => self.ui_switch_case(ui),
+                    Dialog::Json => self.ui_json(ui),
                     Dialog::Variable => {
                         if let ActionKind::SetVar { name, value } = &mut self.draft {
                             ui.horizontal(|ui| {
@@ -3270,6 +3374,7 @@ impl AmkApp {
             ActionKind::MouseClick { .. } => 1,
             ActionKind::MouseDrag { .. } => 3,
             ActionKind::MouseWheel { .. } => 4,
+            ActionKind::RandomMouse { .. } => 5,
             _ => 1,
         };
         ui.horizontal(|ui| {
@@ -3278,6 +3383,7 @@ impl AmkApp {
             ui.selectable_value(&mut mode, 2, t(self.lang, "mouse_dbl"));
             ui.selectable_value(&mut mode, 3, t(self.lang, "mouse_drag"));
             ui.selectable_value(&mut mode, 4, t(self.lang, "mouse_wheel"));
+            ui.selectable_value(&mut mode, 5, t(self.lang, "mouse_random"));
         });
         let (mut x, mut y, mut x2, mut y2, mut btn, mut delta, mut ms) = match &self.draft {
             ActionKind::MouseMove { x, y, ms } => {
@@ -3293,6 +3399,9 @@ impl AmkApp {
                 ms,
             } => (*x1, *y1, *x2, *y2, *button, 0, *ms),
             ActionKind::MouseWheel { delta } => (0, 0, 0, 0, MouseBtn::Left, *delta, 0),
+            ActionKind::RandomMouse { x1, y1, x2, y2, .. } => {
+                (*x1, *y1, *x2, *y2, MouseBtn::Left, 0, 0)
+            }
             _ => (0, 0, 0, 0, MouseBtn::Left, 0, 0),
         };
         if mode != 4 {
@@ -3309,7 +3418,7 @@ impl AmkApp {
                 ui.add(egui::DragValue::new(&mut ms).clamp_range(0..=60_000));
             });
         }
-        if mode == 3 {
+        if mode == 3 || mode == 5 {
             ui.horizontal(|ui| {
                 ui.label("X2");
                 ui.add(egui::DragValue::new(&mut x2));
@@ -3348,6 +3457,14 @@ impl AmkApp {
                 ms,
             },
             4 => ActionKind::MouseWheel { delta },
+            5 => ActionKind::RandomMouse {
+                x1: x,
+                y1: y,
+                x2,
+                y2,
+                save_x: "rnd_x".into(),
+                save_y: "rnd_y".into(),
+            },
             _ => ActionKind::MouseClick {
                 button: btn,
                 x,
@@ -3412,12 +3529,54 @@ impl AmkApp {
     fn ui_clipboard(&mut self, ui: &mut egui::Ui) {
         let mut mode = match &self.draft {
             ActionKind::GetClipboard { .. } => 1,
+            ActionKind::WaitClipboard { .. } => 2,
             _ => 0,
         };
         ui.horizontal(|ui| {
             ui.selectable_value(&mut mode, 0, t(self.lang, "clip_set"));
             ui.selectable_value(&mut mode, 1, t(self.lang, "clip_get"));
+            ui.selectable_value(&mut mode, 2, t(self.lang, "clip_wait"));
         });
+        if mode == 2 {
+            let (mut exclude, mut save_name, mut timeout_ms, mut on_fail) = match &self.draft {
+                ActionKind::WaitClipboard {
+                    exclude,
+                    save_name,
+                    timeout_ms,
+                    on_fail,
+                    ..
+                } => (
+                    exclude.clone(),
+                    save_name.clone(),
+                    *timeout_ms,
+                    on_fail.clone(),
+                ),
+                _ => (String::new(), "clip".into(), 30_000u64, "skip".into()),
+            };
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "clip_exclude"));
+                ui.text_edit_singleline(&mut exclude);
+            });
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "var_name"));
+                ui.text_edit_singleline(&mut save_name);
+            });
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "timeout"));
+                ui.add(egui::DragValue::new(&mut timeout_ms).clamp_range(0..=3_600_000));
+            });
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "on_fail"));
+                ui.text_edit_singleline(&mut on_fail);
+            });
+            self.draft = ActionKind::WaitClipboard {
+                exclude,
+                save_name,
+                timeout_ms,
+                on_fail,
+            };
+            return;
+        }
         match mode {
             0 => {
                 let mut text = match &self.draft {
@@ -3528,6 +3687,42 @@ impl AmkApp {
         }
     }
 
+    fn ui_switch_case(&mut self, ui: &mut egui::Ui) {
+        match &mut self.draft {
+            ActionKind::Switch { expr } => {
+                ui.horizontal(|ui| {
+                    ui.label(t(self.lang, "expr"));
+                    ui.text_edit_singleline(expr);
+                });
+            }
+            ActionKind::Case { value } => {
+                ui.horizontal(|ui| {
+                    ui.label(t(self.lang, "value"));
+                    ui.text_edit_singleline(value);
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn ui_json(&mut self, ui: &mut egui::Ui) {
+        if let ActionKind::ReadJson { file, query, name } = &mut self.draft {
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "json_file"));
+                ui.text_edit_singleline(file);
+            });
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "json_query"));
+                ui.text_edit_singleline(query);
+            });
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "var_name"));
+                ui.text_edit_singleline(name);
+            });
+            ui.label(t(self.lang, "json_hint"));
+        }
+    }
+
     fn ui_window(&mut self, ui: &mut egui::Ui) {
         let mut mode = match &self.draft {
             ActionKind::CloseWindow { .. } => 1,
@@ -3584,16 +3779,19 @@ impl AmkApp {
         let mut mode = match &self.draft {
             ActionKind::OpenUrl { .. } => 1,
             ActionKind::OpenFolder { .. } => 2,
+            ActionKind::PlayRandom { .. } => 3,
             _ => 0,
         };
         ui.horizontal(|ui| {
             ui.selectable_value(&mut mode, 0, t(self.lang, "file_open"));
             ui.selectable_value(&mut mode, 1, t(self.lang, "file_url"));
             ui.selectable_value(&mut mode, 2, t(self.lang, "file_folder"));
+            ui.selectable_value(&mut mode, 3, t(self.lang, "file_random"));
         });
         let mut s = match &self.draft {
             ActionKind::OpenFile { path } | ActionKind::OpenFolder { path } => path.clone(),
             ActionKind::OpenUrl { url } => url.clone(),
+            ActionKind::PlayRandom { folder } => folder.clone(),
             _ => String::new(),
         };
         ui.horizontal(|ui| {
@@ -3607,6 +3805,7 @@ impl AmkApp {
         self.draft = match mode {
             1 => ActionKind::OpenUrl { url: s },
             2 => ActionKind::OpenFolder { path: s },
+            3 => ActionKind::PlayRandom { folder: s },
             _ => ActionKind::OpenFile { path: s },
         };
     }

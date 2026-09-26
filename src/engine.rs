@@ -526,6 +526,28 @@ fn enclosing_loop(actions: &[Action], from: usize) -> Option<(usize, usize)> {
     None
 }
 
+/// Next switch boundary scanning forward from `from`: the matching EndSwitch,
+/// or (when `cases`) the next Case/DefaultCase of the same switch.
+fn find_switch_boundary(actions: &[Action], from: usize, cases: bool) -> Option<usize> {
+    let mut depth = 0i32;
+    for (j, a) in actions.iter().enumerate().skip(from) {
+        match &a.kind {
+            ActionKind::Switch { .. } => depth += 1,
+            ActionKind::EndSwitch => {
+                if depth == 0 {
+                    return Some(j);
+                }
+                depth -= 1;
+            }
+            ActionKind::Case { .. } | ActionKind::DefaultCase if depth == 0 && cases => {
+                return Some(j);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn run_once(
     script: &Script,
     env: &RunEnv<'_>,
@@ -555,6 +577,8 @@ fn run_once(
     let mut i = 0usize;
     // start, var, next_value, to, step
     let mut for_stack: Vec<(usize, String, i64, i64, i64)> = Vec::new();
+    // switch value, a case already matched
+    let mut switch_stack: Vec<(String, bool)> = Vec::new();
     let mut while_stack: Vec<usize> = Vec::new();
     let mut call_stack: Vec<usize> = Vec::new();
     let mut steps = 0u32;
@@ -709,6 +733,56 @@ fn run_once(
                     } else {
                         push_line(env.log, format!("Call {name}: not found"));
                     }
+                }
+            }
+            ActionKind::Switch { expr } => {
+                if skip_depth > 0 {
+                    skip_depth += 1;
+                } else {
+                    let v = eval::eval_value(expr, &vars);
+                    switch_stack.push((v, false));
+                }
+            }
+            ActionKind::Case { .. } | ActionKind::DefaultCase => {
+                if skip_depth == 0 {
+                    let is_default = matches!(a.kind, ActionKind::DefaultCase);
+                    let empty = String::new();
+                    let case_value = match &a.kind {
+                        ActionKind::Case { value } => value,
+                        _ => &empty,
+                    };
+                    match switch_stack.last_mut() {
+                        Some((want, matched)) => {
+                            if *matched {
+                                // An earlier case ran: jump past the rest.
+                                if let Some(end) = find_switch_boundary(actions, i + 1, false) {
+                                    i = end;
+                                    continue;
+                                }
+                                i = actions.len();
+                                continue;
+                            }
+                            let hit = is_default || case_value.trim() == want.trim();
+                            if hit {
+                                *matched = true;
+                            } else if let Some(next) = find_switch_boundary(actions, i + 1, true) {
+                                i = next;
+                                continue;
+                            } else {
+                                // Malformed switch without EndSwitch.
+                                i = actions.len();
+                                continue;
+                            }
+                        }
+                        None => push_line(env.log, "Case: no Switch"),
+                    }
+                }
+            }
+            ActionKind::EndSwitch => {
+                if skip_depth > 0 {
+                    skip_depth -= 1;
+                } else {
+                    switch_stack.pop();
                 }
             }
             ActionKind::Break | ActionKind::Continue => {
@@ -1016,6 +1090,109 @@ fn exec_action(
             vars.insert(name.clone(), n.to_string());
             push(format!("Random {name} = {n}"));
         }
+        ActionKind::RandomMouse {
+            x1,
+            y1,
+            x2,
+            y2,
+            save_x,
+            save_y,
+        } => {
+            let rx =
+                random_in_range((*x1).min(*x2) as i64, (*x1).max(*x2) as i64, next_draw()) as i32;
+            let ry =
+                random_in_range((*y1).min(*y2) as i64, (*y1).max(*y2) as i64, next_draw()) as i32;
+            vars.insert(save_x.clone(), rx.to_string());
+            vars.insert(save_y.clone(), ry.to_string());
+            if live {
+                if let Some(e) = enigo.as_mut() {
+                    let _ = e.move_mouse(rx, ry, enigo::Coordinate::Abs);
+                }
+                push(format!("Random mouse ({rx},{ry})"));
+            } else {
+                push(format!("Random mouse ({rx},{ry}) logic-skip"));
+            }
+        }
+        ActionKind::ReadJson { file, query, name } => {
+            // Pure data processing: runs in both modes.
+            let file = eval::expand_text(file, vars);
+            let query = eval::expand_text(query, vars);
+            let resolved = resolve_script_path(&file, env.script_dir);
+            match std::fs::read_to_string(&resolved)
+                .ok()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            {
+                Some(mut v) => {
+                    let mut ok = true;
+                    for seg in query.split('.').filter(|s| !s.is_empty()) {
+                        let next = if let Some(arr) = v.as_array() {
+                            seg.parse::<usize>().ok().and_then(|i| arr.get(i)).cloned()
+                        } else {
+                            v.get(seg).cloned()
+                        };
+                        match next {
+                            Some(x) => v = x,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        let text = match &v {
+                            serde_json::Value::String(sv) => sv.clone(),
+                            other => other.to_string(),
+                        };
+                        vars.insert(name.clone(), text);
+                        push(format!("Read JSON {name}"));
+                    } else {
+                        push(format!("Read JSON `{query}` not found in {file}"));
+                    }
+                }
+                None => push(format!("Read JSON read failed: {file}")),
+            }
+        }
+        ActionKind::WaitClipboard {
+            exclude,
+            save_name,
+            timeout_ms,
+            on_fail,
+        } => {
+            let exclude = eval::expand_text(exclude, vars);
+            if !live {
+                push(format!("Wait Clipboard {save_name} logic-skip"));
+            } else {
+                let baseline = if exclude.trim().is_empty() {
+                    crate::clipboard::get_text().unwrap_or_default()
+                } else {
+                    exclude
+                };
+                let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
+                loop {
+                    if env.stop.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    if !wait_pause(env.pause, env.stop) {
+                        return false;
+                    }
+                    if let Some(text) = crate::clipboard::get_text() {
+                        if !text.is_empty() && text != baseline {
+                            vars.insert(save_name.clone(), text);
+                            push(format!("Clipboard changed -> {save_name}"));
+                            break;
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        push(format!("Wait Clipboard timeout ({save_name})"));
+                        if on_fail.eq_ignore_ascii_case("stop") {
+                            return false;
+                        }
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
         ActionKind::Command { cmd } => {
             let cmd = eval::expand_text(cmd, vars);
             push(format!("Command: {cmd}"));
@@ -1147,54 +1324,97 @@ fn exec_action(
                 return false;
             }
             let resolved = resolve_script_path(&path, env.script_dir);
-            // Parse each child once per run: a PlayScript inside a While loop
-            // must not re-read and re-parse the file on every iteration.
-            let child = {
-                let mut cache = env.scripts.borrow_mut();
-                match cache.entry(resolved.clone()) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-                    std::collections::hash_map::Entry::Vacant(e) => {
-                        let parsed = std::fs::read_to_string(&resolved)
-                            .ok()
-                            .and_then(|s| Script::load_json(&s).ok())
-                            .map(Arc::new);
-                        e.insert(parsed).clone()
+            if !run_child_script(resolved, env, vars, &path) {
+                return false;
+            }
+        }
+        ActionKind::PlayRandom { folder } => {
+            let folder = eval::expand_text(folder, vars);
+            push(format!("Play random from {folder}"));
+            if env.depth >= 8 {
+                push("Play script depth limit".into());
+                return false;
+            }
+            let dir = {
+                let p = Path::new(&folder);
+                if p.is_dir() {
+                    PathBuf::from(p)
+                } else {
+                    match env.script_dir {
+                        Some(d) if d.join(&folder).is_dir() => d.join(&folder),
+                        _ => PathBuf::from(&folder),
                     }
                 }
             };
-            match child {
-                Some(sc) => {
-                    let nested_dir = resolved.parent().map(|p| p.to_path_buf());
-                    let nested = RunEnv {
-                        speed: env.speed,
-                        stop: env.stop,
-                        pause: env.pause,
-                        current: env.current,
-                        log: env.log,
-                        script_dir: nested_dir.as_deref().or(env.script_dir),
-                        mode: env.mode,
-                        depth: env.depth + 1,
-                        state: env.state,
-                        step_once: env.step_once,
-                        step_over: env.step_over,
-                        step_over_floor: env.step_over_floor,
-                        scripts: env.scripts,
-                    };
-                    let (ok, child_vars) = run_once(&sc, &nested, vars);
-                    *vars = child_vars;
-                    if !ok {
-                        return false;
-                    }
-                }
-                None => {
-                    push(format!("Play script load failed: {path}"));
-                    return false;
-                }
+            let mut candidates: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().map(|e| e == "amk").unwrap_or(false))
+                .collect();
+            candidates.sort();
+            if candidates.is_empty() {
+                push(format!("Play random: no .amk in {folder}"));
+                return false;
+            }
+            let idx = random_in_range(0, candidates.len() as i64 - 1, next_draw()) as usize;
+            let picked = candidates[idx].clone();
+            push(format!("Play random -> {}", picked.display()));
+            if !run_child_script(picked, env, vars, &folder) {
+                return false;
             }
         }
         _ => {}
     }
     true
+}
+
+/// Parse (once per run, cached) and run a child script, sharing variables.
+fn run_child_script(
+    resolved: PathBuf,
+    env: &RunEnv<'_>,
+    vars: &mut HashMap<String, String>,
+    display_name: &str,
+) -> bool {
+    // Parse each child once per run: a PlayScript inside a While loop must
+    // not re-read and re-parse the file on every iteration.
+    let child = {
+        let mut cache = env.scripts.borrow_mut();
+        match cache.entry(resolved.clone()) {
+            std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let parsed = std::fs::read_to_string(&resolved)
+                    .ok()
+                    .and_then(|s| Script::load_json(&s).ok())
+                    .map(Arc::new);
+                e.insert(parsed).clone()
+            }
+        }
+    };
+    let Some(sc) = child else {
+        push_line(env.log, format!("Play script load failed: {display_name}"));
+        return false;
+    };
+    let nested_dir = resolved.parent().map(|p| p.to_path_buf());
+    let nested = RunEnv {
+        speed: env.speed,
+        stop: env.stop,
+        pause: env.pause,
+        current: env.current,
+        log: env.log,
+        script_dir: nested_dir.as_deref().or(env.script_dir),
+        mode: env.mode,
+        depth: env.depth + 1,
+        state: env.state,
+        step_once: env.step_once,
+        step_over: env.step_over,
+        step_over_floor: env.step_over_floor,
+        scripts: env.scripts,
+    };
+    let (ok, child_vars) = run_once(&sc, &nested, vars);
+    *vars = child_vars;
+    ok
 }
 
 fn resolve_script_path(path: &str, script_dir: Option<&Path>) -> PathBuf {
@@ -1911,6 +2131,133 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(s).unwrap();
         let k: ActionKind = serde_json::from_value(v.get("kind").unwrap().clone()).unwrap();
         assert!(matches!(k, ActionKind::MouseMove { x: 7, y: 9, ms: 0 }));
+    }
+
+    #[test]
+    fn switch_runs_matching_case_and_default_when_no_match() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "2".into(),
+            },
+            ActionKind::Switch { expr: "n".into() },
+            ActionKind::Case { value: "1".into() },
+            ActionKind::SetVar {
+                name: "r".into(),
+                value: "one".into(),
+            },
+            ActionKind::Case { value: "2".into() },
+            ActionKind::SetVar {
+                name: "r".into(),
+                value: "two".into(),
+            },
+            ActionKind::DefaultCase,
+            ActionKind::SetVar {
+                name: "r".into(),
+                value: "other".into(),
+            },
+            ActionKind::EndSwitch,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("r").map(String::as_str), Some("two"));
+    }
+
+    #[test]
+    fn switch_default_runs_when_no_case_matches() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "9".into(),
+            },
+            ActionKind::Switch { expr: "n".into() },
+            ActionKind::Case { value: "1".into() },
+            ActionKind::SetVar {
+                name: "r".into(),
+                value: "one".into(),
+            },
+            ActionKind::DefaultCase,
+            ActionKind::SetVar {
+                name: "r".into(),
+                value: "other".into(),
+            },
+            ActionKind::EndSwitch,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("r").map(String::as_str), Some("other"));
+    }
+
+    #[test]
+    fn random_mouse_picks_inside_the_rect_and_saves_vars() {
+        let sc = kinds(vec![ActionKind::RandomMouse {
+            x1: 10,
+            y1: 20,
+            x2: 30,
+            y2: 40,
+            save_x: "rx".into(),
+            save_y: "ry".into(),
+        }]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        let rx: i32 = r.vars.get("rx").unwrap().parse().unwrap();
+        let ry: i32 = r.vars.get("ry").unwrap().parse().unwrap();
+        assert!((10..=30).contains(&rx), "{rx}");
+        assert!((20..=40).contains(&ry), "{ry}");
+    }
+
+    #[test]
+    fn read_json_stores_the_value_at_the_dot_path() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("amk_json_{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"a":{"b":[10,20,{"c":"hi"}]}}"#).unwrap();
+        let sc = kinds(vec![
+            ActionKind::ReadJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "a.b.1".into(),
+                name: "v".into(),
+            },
+            ActionKind::ReadJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "a.b.2.c".into(),
+                name: "w".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        let _ = std::fs::remove_file(&path);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("v").map(String::as_str), Some("20"));
+        assert_eq!(r.vars.get("w").map(String::as_str), Some("hi"));
+    }
+
+    #[test]
+    fn play_random_runs_a_script_from_the_folder() {
+        let dir = std::env::temp_dir().join(format!("amk_rand_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("only.amk"),
+            r#"{"version":"1.0","name":"c","actions":[{"id":"c1","name":"set","enabled":true,"delay_ms":0,"kind":{"SetVar":{"name":"nested","value":"yes"}}}]}"#,
+        )
+        .unwrap();
+        let sc = kinds(vec![ActionKind::PlayRandom {
+            folder: dir.to_string_lossy().into_owned(),
+        }]);
+        let r = run_logic(&sc);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("nested").map(String::as_str), Some("yes"));
+    }
+
+    #[test]
+    fn play_random_without_scripts_fails_the_run() {
+        let dir = std::env::temp_dir().join(format!("amk_empty_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sc = kinds(vec![ActionKind::PlayRandom {
+            folder: dir.to_string_lossy().into_owned(),
+        }]);
+        let r = run_logic(&sc);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(!r.ok);
     }
 
     #[test]
