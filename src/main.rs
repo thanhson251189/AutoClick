@@ -125,6 +125,15 @@ fn install_fonts(ctx: &egui::Context) {
 fn apply_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::light();
+    // Slightly above egui defaults: the dense action table reads better.
+    style.text_styles = [
+        (egui::TextStyle::Heading, egui::FontId::proportional(19.0)),
+        (egui::TextStyle::Body, egui::FontId::proportional(14.0)),
+        (egui::TextStyle::Button, egui::FontId::proportional(14.0)),
+        (egui::TextStyle::Small, egui::FontId::proportional(11.0)),
+        (egui::TextStyle::Monospace, egui::FontId::monospace(13.0)),
+    ]
+    .into();
     let line = egui::Color32::from_rgb(226, 230, 235);
     let ink = egui::Color32::from_rgb(28, 36, 48);
     style.visuals.window_fill = egui::Color32::from_rgb(244, 246, 248);

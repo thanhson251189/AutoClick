@@ -687,7 +687,9 @@ pub fn find_template(
 fn scaled_size(tmpl: &RgbImage, scale: f32) -> Option<(i32, i32)> {
     let nw = (tmpl.w as f32 * scale).round() as i32;
     let nh = (tmpl.h as f32 * scale).round() as i32;
-    if nw < 6 || nh < 6 || (nw == tmpl.w && nh == tmpl.h) {
+    // Bound the resample allocation: a huge template must not OOM the
+    // process before the screen-size guards downstream get a chance.
+    if nw < 6 || nh < 6 || nw > 16_384 || nh > 16_384 || (nw == tmpl.w && nh == tmpl.h) {
         None
     } else {
         Some((nw, nh))
@@ -1129,6 +1131,23 @@ mod tests {
             .expect("match at an unprobed coarse residue must be found");
         assert_eq!((hit.0, hit.1), (78, 36));
         assert_eq!((hit.2, hit.3), (side, side));
+    }
+
+    #[test]
+    fn scaled_size_bounds_the_resample_allocation() {
+        let big = RgbImage {
+            w: 30000,
+            h: 30000,
+            rgb: Vec::new(),
+        };
+        // A 1.25x resample of this used to try a ~4 GB allocation.
+        assert!(scaled_size(&big, 1.25).is_none());
+        assert!(scaled_size(&big, 2.0).is_none());
+        // Normal scaling still works.
+        assert_eq!(
+            scaled_size(&solid(100, 100, (0, 0, 0)), 1.1).map(|s| (s.0, s.1)),
+            Some((110, 110))
+        );
     }
 
     #[test]

@@ -187,6 +187,39 @@ impl AmkApp {
             last_title: String::new(),
         };
         app.sync_placeholder_comment();
+        // Dev affordance: AMK_DIALOG=mouse|keyboard|options|hotkeys|schedule|
+        // clicker|presser|log|about|help opens that dialog on launch so the
+        // UI can be inspected without driving input.
+        if let Ok(d) = std::env::var("AMK_DIALOG") {
+            if d == "mouse" {
+                app.draft = ActionKind::MouseClick {
+                    button: MouseBtn::Left,
+                    x: 960,
+                    y: 540,
+                    clicks: 1,
+                };
+            }
+            if d == "keyboard" {
+                app.draft = ActionKind::TypeText {
+                    text: "Hello".into(),
+                    interval_ms: 20,
+                };
+            }
+            app.dialog = match d.as_str() {
+                "mouse" => Dialog::Mouse,
+                "keyboard" => Dialog::Keyboard,
+                "delay" => Dialog::Delay,
+                "options" => Dialog::Options,
+                "hotkeys" => Dialog::Hotkeys,
+                "schedule" => Dialog::Schedule,
+                "clicker" => Dialog::Clicker,
+                "presser" => Dialog::Presser,
+                "log" => Dialog::Log,
+                "about" => Dialog::About,
+                "help" => Dialog::Help,
+                _ => Dialog::None,
+            };
+        }
         app
     }
 
@@ -2177,8 +2210,8 @@ impl AmkApp {
             None
         };
 
-        let header_h = 32.0;
-        let row_h = 34.0;
+        let header_h = 34.0;
+        let row_h = 38.0;
         let view_w = ui.available_width().max(1.0);
         let compact = view_w < 560.0;
         let w_step = if compact { 44.0 } else { 52.0 };
@@ -2232,10 +2265,13 @@ impl AmkApp {
             .id_source("action_table_scroll")
             .auto_shrink([false, false])
             .max_height((ui.available_height() - 4.0).max(0.0))
-            .show(ui, |ui| {
+            // Uniform row height: render only the visible slice so long
+            // recordings cost O(screen) per frame, not O(script).
+            .show_rows(ui, row_h, self.script.actions.len(), |ui, row_range| {
                 ui.set_width(view_w);
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for (i, &indent) in indents.iter().enumerate() {
+                for i in row_range {
+                    let indent = indents[i];
                     let selected = self.selected == Some(i);
                     let playing = playing_idx == Some(i);
 
@@ -2275,11 +2311,11 @@ impl AmkApp {
                     } else if playing {
                         Color32::from_rgb(255, 248, 232)
                     } else if resp.hovered() {
-                        Color32::from_rgb(245, 247, 250)
+                        Color32::from_rgb(239, 243, 248)
                     } else if i % 2 == 0 {
                         Color32::WHITE
                     } else {
-                        Color32::from_rgb(250, 251, 252)
+                        Color32::from_rgb(245, 247, 250)
                     };
                     ui.painter().rect_filled(rect, 0.0, bg);
                     if selected || playing {
@@ -2453,6 +2489,17 @@ impl AmkApp {
         }
     }
 
+    /// A play-options row with a fixed height and vertical centering, so
+    /// radios, number boxes, and combo boxes share one optical line even with
+    /// their different native widget heights.
+    fn option_row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), 28.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            add,
+        );
+    }
+
     fn play_options(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .id_source("play_opts_scroll")
@@ -2472,7 +2519,7 @@ impl AmkApp {
                     ui.label(
                         RichText::new(t(self.lang, "play_opts"))
                             .strong()
-                            .size(13.0)
+                            .size(14.0)
                             .color(Color32::from_rgb(28, 36, 48)),
                     );
                 });
@@ -2486,10 +2533,14 @@ impl AmkApp {
         egui::Frame::none()
             .inner_margin(egui::Margin::symmetric(8.0, 0.0))
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.spacing_mut().item_spacing.y = 3.0;
+                // Uniform control height: the combo box otherwise grows with
+                // the global button padding and every row misaligns.
+                ui.spacing_mut().interact_size.y = 24.0;
+                ui.spacing_mut().button_padding.y = 4.0;
 
                 // ── Play Repetition ───────────────────────────────────────
-                ui.add_space(10.0);
+                ui.add_space(2.0);
                 ui.label(
                     RichText::new(t(self.lang, "play_rep"))
                         .strong()
@@ -2498,39 +2549,45 @@ impl AmkApp {
                 );
                 ui.add_space(4.0);
 
-                ui.radio_value(
-                    &mut self.repeat,
-                    RepeatMode::Once,
-                    t(self.lang, "play_once"),
-                );
+                Self::option_row(ui, |ui| {
+                    ui.radio_value(
+                        &mut self.repeat,
+                        RepeatMode::Once,
+                        t(self.lang, "play_once"),
+                    );
+                });
 
-                ui.horizontal(|ui| {
+                Self::option_row(ui, |ui| {
                     ui.radio_value(
                         &mut self.repeat,
                         RepeatMode::Times,
                         t(self.lang, "play_script_n"),
                     );
-                    ui.add_enabled(
-                        self.repeat == RepeatMode::Times,
-                        egui::DragValue::new(&mut self.repeat_n)
-                            .clamp_range(1..=1_000_000)
-                            .speed(1),
-                    );
+                    ui.add_enabled_ui(self.repeat == RepeatMode::Times, |ui| {
+                        ui.add_sized(
+                            egui::vec2(52.0, 24.0),
+                            egui::DragValue::new(&mut self.repeat_n)
+                                .clamp_range(1..=1_000_000)
+                                .speed(1),
+                        );
+                    });
                     ui.label(t(self.lang, "times"));
                 });
 
-                ui.horizontal(|ui| {
+                Self::option_row(ui, |ui| {
                     ui.radio_value(
                         &mut self.repeat,
                         RepeatMode::Duration,
                         t(self.lang, "play_for"),
                     );
-                    ui.add_enabled(
-                        self.repeat == RepeatMode::Duration,
-                        egui::DragValue::new(&mut self.duration_n)
-                            .clamp_range(1..=10_000)
-                            .speed(1),
-                    );
+                    ui.add_enabled_ui(self.repeat == RepeatMode::Duration, |ui| {
+                        ui.add_sized(
+                            egui::vec2(52.0, 24.0),
+                            egui::DragValue::new(&mut self.duration_n)
+                                .clamp_range(1..=10_000)
+                                .speed(1),
+                        );
+                    });
                     egui::ComboBox::from_id_source("dur_unit")
                         .selected_text(match self.duration_unit {
                             DurationUnit::Seconds => t(self.lang, "secs"),
@@ -2557,21 +2614,23 @@ impl AmkApp {
                         });
                 });
 
-                ui.radio_value(
-                    &mut self.repeat,
-                    RepeatMode::Infinite,
-                    t(self.lang, "repeat_until_stop"),
-                );
+                Self::option_row(ui, |ui| {
+                    ui.radio_value(
+                        &mut self.repeat,
+                        RepeatMode::Infinite,
+                        t(self.lang, "repeat_until_stop"),
+                    );
+                });
 
                 // separator
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 let (r, _) =
                     ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
                 ui.painter()
                     .line_segment([r.left_top(), r.right_top()], sep_stroke);
 
                 // ── Execution Options ─────────────────────────────────────
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new(t(self.lang, "exec_opts"))
                         .strong()
@@ -2580,21 +2639,25 @@ impl AmkApp {
                 );
                 ui.add_space(4.0);
 
-                ui.horizontal(|ui| {
+                Self::option_row(ui, |ui| {
                     ui.checkbox(&mut self.speed_enabled, t(self.lang, "speed_short"));
-                    ui.add_enabled(
-                        self.speed_enabled,
-                        egui::DragValue::new(&mut self.options.play_speed)
-                            .clamp_range(0.1..=10.0)
-                            .speed(0.1)
-                            .fixed_decimals(1)
-                            .suffix("x"),
+                    ui.add_enabled_ui(self.speed_enabled, |ui| {
+                        ui.add_sized(
+                            egui::vec2(56.0, 24.0),
+                            egui::DragValue::new(&mut self.options.play_speed)
+                                .clamp_range(0.1..=10.0)
+                                .speed(0.1)
+                                .fixed_decimals(1)
+                                .suffix("x"),
+                        );
+                    });
+                });
+                Self::option_row(ui, |ui| {
+                    ui.checkbox(
+                        &mut self.options.minimize_on_play,
+                        t(self.lang, "minimize_on_start"),
                     );
                 });
-                ui.checkbox(
-                    &mut self.options.minimize_on_play,
-                    t(self.lang, "minimize_on_start"),
-                );
 
                 // separator
                 ui.add_space(4.0);
@@ -2604,7 +2667,7 @@ impl AmkApp {
                     .line_segment([r.left_top(), r.right_top()], sep_stroke);
 
                 // ── Hotkeys ───────────────────────────────────────────────
-                ui.add_space(6.0);
+                ui.add_space(4.0);
                 ui.label(
                     RichText::new(t(self.lang, "hk_section"))
                         .strong()
@@ -2641,24 +2704,34 @@ impl AmkApp {
                     );
                 };
 
-                ui.horizontal(|ui| {
-                    ui.label(t(self.lang, "hk_record_short"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        draw_key_badge(ui, &self.options.hk_record, false);
-                    });
+                // Fixed-width label column: the badges line up as a column
+                // instead of ragging left when the labels differ in width.
+                let hk_label = |ui: &mut egui::Ui, key: &str| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(104.0, 24.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(t(self.lang, key));
+                        },
+                    );
+                };
+                Self::option_row(ui, |ui| {
+                    hk_label(ui, "hk_record_short");
+                    draw_key_badge(ui, &self.options.hk_record, false);
                 });
-                ui.horizontal(|ui| {
-                    ui.label(t(self.lang, "hk_play_short"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        draw_key_badge(ui, &self.options.hk_play, false);
-                    });
+                Self::option_row(ui, |ui| {
+                    hk_label(ui, "hk_play_short");
+                    draw_key_badge(ui, &self.options.hk_play, false);
                 });
-                ui.horizontal(|ui| {
-                    ui.label(t(self.lang, "hk_stop_short"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        draw_key_badge(ui, &self.options.hk_stop, true);
-                    });
+                Self::option_row(ui, |ui| {
+                    hk_label(ui, "hk_stop_short");
+                    draw_key_badge(ui, &self.options.hk_stop, true);
                 });
+                ui.label(
+                    RichText::new(t(self.lang, "hk_more"))
+                        .size(11.0)
+                        .color(Color32::from_rgb(122, 132, 144)),
+                );
             });
 
         ui.add_space(10.0);
@@ -2809,7 +2882,16 @@ impl AmkApp {
             .collapsible(false)
             .resizable(true)
             .default_width(420.0)
+            .min_width(380.0)
             .show(ctx, |ui| {
+                // egui shrinks windows to content: keep the sparse dialogs
+                // (options/schedule/tools) at a dignified width.
+                if matches!(
+                    self.dialog,
+                    Dialog::Options | Dialog::Schedule | Dialog::Clicker | Dialog::Presser
+                ) {
+                    ui.set_min_width(340.0);
+                }
                 if !matches!(
                     self.dialog,
                     Dialog::About
@@ -2942,25 +3024,30 @@ impl AmkApp {
                         }
                     }
                     Dialog::Options => {
-                        ui.checkbox(
-                            &mut self.options.minimize_on_play,
-                            t(self.lang, "opt_minimize"),
-                        );
-                        ui.horizontal(|ui| {
+                        ui.spacing_mut().interact_size.y = 24.0;
+                        Self::option_row(ui, |ui| {
+                            ui.checkbox(
+                                &mut self.options.minimize_on_play,
+                                t(self.lang, "opt_minimize"),
+                            );
+                        });
+                        Self::option_row(ui, |ui| {
                             ui.label(t(self.lang, "opt_sample"));
-                            ui.add(
+                            ui.add_sized(
+                                egui::vec2(64.0, 24.0),
                                 egui::DragValue::new(&mut self.options.sample_ms)
                                     .clamp_range(5..=500),
                             );
                         });
-                        ui.horizontal(|ui| {
+                        Self::option_row(ui, |ui| {
                             ui.label(t(self.lang, "opt_ignore_move"));
-                            ui.add(
+                            ui.add_sized(
+                                egui::vec2(64.0, 24.0),
                                 egui::DragValue::new(&mut self.options.ignore_px)
                                     .clamp_range(0..=50),
                             );
                         });
-                        ui.horizontal(|ui| {
+                        Self::option_row(ui, |ui| {
                             ui.label(t(self.lang, "speed"));
                             ui.add(egui::Slider::new(&mut self.options.play_speed, 0.1..=8.0));
                         });
@@ -3010,12 +3097,22 @@ impl AmkApp {
                         egui::ScrollArea::vertical()
                             .max_height(280.0)
                             .show(ui, |ui| {
-                                for line in self.engine.logs() {
-                                    ui.monospace(format!("{}  {}", line.time, line.text));
-                                }
+                                // Borrow the log in place: cloning up to
+                                // LOG_CAP lines every frame is real work.
+                                self.engine.with_log(|lines| {
+                                    for line in lines {
+                                        ui.monospace(format!("{}  {}", line.time, line.text));
+                                    }
+                                });
                             });
                     }
                     Dialog::Schedule => {
+                        if self.tasks.is_empty() {
+                            ui.label(
+                                RichText::new(t(self.lang, "schedule_empty"))
+                                    .color(Color32::from_rgb(110, 120, 132)),
+                            );
+                        }
                         if ui.button(t(self.lang, "add_task")).clicked() {
                             self.tasks.push(ScheduledTask {
                                 name: "Task".into(),
@@ -3057,7 +3154,7 @@ impl AmkApp {
                             ui.label(t(self.lang, "repeat_count"));
                             ui.add(egui::DragValue::new(&mut self.clicker_count));
                         });
-                        if ui.button(t(self.lang, "play")).clicked() {
+                        if dialog_primary_button(ui, t(self.lang, "play")).clicked() {
                             self.snapshot();
                             let mut s = Script::default();
                             s.actions.clear();
@@ -3102,7 +3199,7 @@ impl AmkApp {
                             ui.label(t(self.lang, "repeat_count"));
                             ui.add(egui::DragValue::new(&mut self.presser_count));
                         });
-                        if ui.button(t(self.lang, "play")).clicked() {
+                        if dialog_primary_button(ui, t(self.lang, "play")).clicked() {
                             self.snapshot();
                             let mut s = Script::default();
                             s.actions.clear();
@@ -3145,11 +3242,12 @@ impl AmkApp {
                         | Dialog::Presser
                 ) {
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button(t(self.lang, "ok")).clicked() {
+                    // Primary action right-most, styled like the main CTA.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if dialog_primary_button(ui, t(self.lang, "ok")).clicked() {
                             self.commit_draft();
                         }
-                        if ui.button(t(self.lang, "cancel")).clicked() {
+                        if dialog_secondary_button(ui, t(self.lang, "cancel")).clicked() {
                             self.dialog = Dialog::None;
                         }
                     });
@@ -3192,7 +3290,8 @@ impl AmkApp {
                 x2,
                 y2,
                 button,
-            } => (*x1, *y1, *x2, *y2, *button, 0, 0),
+                ms,
+            } => (*x1, *y1, *x2, *y2, *button, 0, *ms),
             ActionKind::MouseWheel { delta } => (0, 0, 0, 0, MouseBtn::Left, *delta, 0),
             _ => (0, 0, 0, 0, MouseBtn::Left, 0, 0),
         };
@@ -3204,7 +3303,7 @@ impl AmkApp {
                 ui.add(egui::DragValue::new(&mut y));
             });
         }
-        if mode == 0 {
+        if mode == 0 || mode == 3 {
             ui.horizontal(|ui| {
                 ui.label(t(self.lang, "move_ms"));
                 ui.add(egui::DragValue::new(&mut ms).clamp_range(0..=60_000));
@@ -3246,6 +3345,7 @@ impl AmkApp {
                 y1: y,
                 x2,
                 y2,
+                ms,
             },
             4 => ActionKind::MouseWheel { delta },
             _ => ActionKind::MouseClick {
@@ -3684,14 +3784,42 @@ fn big_tool(
         egui::pos2(draw.min.x + 4.0, draw.max.y - 20.0),
         egui::pos2(draw.max.x - 4.0, draw.max.y - 2.0),
     );
-    paint_ellipsis(
-        ui,
-        label_rect,
-        label,
-        egui::FontId::proportional(11.0),
-        color,
-    );
+    let label_font = egui::FontId::proportional(11.0);
+    // Center the label under the icon; only over-wide labels fall back to
+    // left-aligned truncation.
+    let label_w = ui.fonts(|f| {
+        f.layout_no_wrap(label.to_string(), label_font.clone(), color)
+            .size()
+            .x
+    });
+    if label_w <= label_rect.width() {
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label.to_string(), label_font, color);
+        let y = label_rect.center().y - galley.size().y * 0.5;
+        ui.painter().galley(
+            egui::pos2(label_rect.center().x - label_w * 0.5, y),
+            galley,
+            color,
+        );
+    } else {
+        paint_ellipsis(ui, label_rect, label, label_font, color);
+    }
     resp.on_hover_text(label)
+}
+
+/// Dialog footer buttons: the primary action mirrors the main blue CTA, the
+/// cancel stays neutral — same pair everywhere so dialogs feel like one app.
+fn dialog_primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(
+        egui::Button::new(RichText::new(text).strong().color(Color32::WHITE))
+            .fill(Color32::from_rgb(47, 111, 237))
+            .min_size(Vec2::new(88.0, 28.0)),
+    )
+}
+
+fn dialog_secondary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    ui.add(egui::Button::new(text).min_size(Vec2::new(72.0, 28.0)))
 }
 
 fn header_cell(ui: &mut egui::Ui, text: &str, w: f32, h: f32) {

@@ -347,6 +347,7 @@ impl PressTracker {
                 y1: p.y,
                 x2: x,
                 y2: y,
+                ms: 0,
             }
         } else {
             ActionKind::MouseClick {
@@ -784,6 +785,7 @@ mod tests {
                 y1,
                 x2,
                 y2,
+                ms: _,
             } => assert_eq!((button, x1, y1, x2, y2), (MouseBtn::Left, 10, 10, 100, 40)),
             other => panic!("{other:?}"),
         }

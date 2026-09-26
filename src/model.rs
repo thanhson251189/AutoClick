@@ -58,6 +58,9 @@ pub enum ActionKind {
         y1: i32,
         x2: i32,
         y2: i32,
+        /// Drag duration in ms: 0 = instant, > 0 = glide like AMK.
+        #[serde(default)]
+        ms: u64,
     },
     MouseWheel {
         delta: i32,
@@ -276,10 +279,15 @@ impl ActionKind {
                 y1,
                 x2,
                 y2,
+                ms,
             } => (
                 "Mouse Drag".into(),
                 format!("{},{} -> {},{}", x1, y1, x2, y2),
-                format!("{} Button", button.as_str()),
+                if *ms > 0 {
+                    format!("{} Button, {} ms", button.as_str(), ms)
+                } else {
+                    format!("{} Button", button.as_str())
+                },
             ),
             ActionKind::MouseWheel { delta } => {
                 ("Mouse Wheel".into(), format!("Delta: {}", delta), "".into())
@@ -403,6 +411,7 @@ impl ActionKind {
                 y1,
                 x2,
                 y2,
+                ..
             } => format!(
                 "Mouse Drag {}  ({},{}) → ({},{})",
                 button.as_str(),

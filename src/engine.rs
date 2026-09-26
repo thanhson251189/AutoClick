@@ -118,6 +118,12 @@ impl Engine {
         lock(&self.log).clone()
     }
 
+    /// Read-only borrow of the log, for rendering without cloning it.
+    pub fn with_log<R>(&self, f: impl FnOnce(&[LogLine]) -> R) -> R {
+        let g = lock(&self.log);
+        f(&g)
+    }
+
     pub fn clear_log(&self) {
         lock(&self.log).clear()
     }
@@ -431,6 +437,32 @@ fn sleep_scaled(ms: u64, speed: f32, pause: &AtomicBool, stop: &AtomicBool) -> b
             return false;
         }
         thread::sleep(Duration::from_millis(8));
+    }
+    true
+}
+
+/// Move to `x,y`: `ms == 0` jumps, `ms > 0` glides there in steps
+/// (stop/pause-aware). Returns false when the run should stop.
+fn glide_or_move(e: &mut Enigo, x: i32, y: i32, ms: u64, env: &RunEnv<'_>) -> bool {
+    let mut glided = false;
+    if ms > 0 {
+        if let Ok((cx, cy)) = e.location() {
+            let steps = (ms / 15).clamp(1, 100);
+            let step_ms = (ms / steps).max(1);
+            for s in 1..=steps {
+                let t = s as f32 / steps as f32;
+                let nx = cx as f32 + (x - cx) as f32 * t;
+                let ny = cy as f32 + (y - cy) as f32 * t;
+                let _ = e.move_mouse(nx.round() as i32, ny.round() as i32, enigo::Coordinate::Abs);
+                if s < steps && !sleep_scaled(step_ms, env.speed, env.pause, env.stop) {
+                    return false;
+                }
+            }
+            glided = true;
+        }
+    }
+    if !glided {
+        let _ = e.move_mouse(x, y, enigo::Coordinate::Abs);
     }
     true
 }
@@ -753,30 +785,8 @@ fn exec_action(
         }
         ActionKind::MouseMove { x, y, ms } => {
             if let Some(e) = enigo.as_mut() {
-                // Duration > 0 glides there AMK-style; 0 jumps as before.
-                let mut glided = false;
-                if *ms > 0 {
-                    if let Ok((cx, cy)) = e.location() {
-                        let steps = (*ms / 15).clamp(1, 100);
-                        let step_ms = (ms / steps).max(1);
-                        for s in 1..=steps {
-                            let t = s as f32 / steps as f32;
-                            let nx = cx as f32 + (*x - cx) as f32 * t;
-                            let ny = cy as f32 + (*y - cy) as f32 * t;
-                            let _ = e.move_mouse(
-                                nx.round() as i32,
-                                ny.round() as i32,
-                                enigo::Coordinate::Abs,
-                            );
-                            if s < steps && !sleep_scaled(step_ms, env.speed, env.pause, env.stop) {
-                                return false;
-                            }
-                        }
-                        glided = true;
-                    }
-                }
-                if !glided {
-                    let _ = e.move_mouse(*x, *y, enigo::Coordinate::Abs);
+                if !glide_or_move(e, *x, *y, *ms, env) {
+                    return false;
                 }
             }
         }
@@ -805,6 +815,7 @@ fn exec_action(
             y1,
             x2,
             y2,
+            ms,
         } => {
             if let Some(e) = enigo.as_mut() {
                 let btn = map_btn(*button);
@@ -813,7 +824,10 @@ fn exec_action(
                 if !sleep_scaled(30, env.speed, env.pause, env.stop) {
                     return false;
                 }
-                let _ = e.move_mouse(*x2, *y2, enigo::Coordinate::Abs);
+                // ms > 0 drags along a glide like AMK; 0 keeps the old jump.
+                if !glide_or_move(e, *x2, *y2, *ms, env) {
+                    return false;
+                }
                 if !sleep_scaled(30, env.speed, env.pause, env.stop) {
                     return false;
                 }
@@ -833,7 +847,13 @@ fn exec_action(
                     if env.stop.load(Ordering::Relaxed) {
                         return false;
                     }
-                    let _ = e.text(&ch.to_string());
+                    // Multiline text: a newline must press Enter — the
+                    // Unicode path does not deliver 0x0A on Windows.
+                    if ch == '\n' {
+                        let _ = e.key(Key::Return, Direction::Click);
+                    } else if ch != '\r' {
+                        let _ = e.text(&ch.to_string());
+                    }
                     if *interval_ms > 0
                         && !sleep_scaled(*interval_ms, env.speed, env.pause, env.stop)
                     {
@@ -1891,6 +1911,25 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(s).unwrap();
         let k: ActionKind = serde_json::from_value(v.get("kind").unwrap().clone()).unwrap();
         assert!(matches!(k, ActionKind::MouseMove { x: 7, y: 9, ms: 0 }));
+    }
+
+    #[test]
+    fn mouse_drag_json_without_ms_still_loads() {
+        // Backward compatibility: scripts written before the drag ms field.
+        let s = r#"{"kind":{"MouseDrag":{"button":"Left","x1":1,"y1":2,"x2":3,"y2":4}}}"#;
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let k: ActionKind = serde_json::from_value(v.get("kind").unwrap().clone()).unwrap();
+        assert!(matches!(
+            k,
+            ActionKind::MouseDrag {
+                x1: 1,
+                y1: 2,
+                x2: 3,
+                y2: 4,
+                ms: 0,
+                ..
+            }
+        ));
     }
 
     #[test]
