@@ -1,14 +1,22 @@
 use crate::capture;
-use crate::eval::eval_truth;
-use crate::model::{ActionKind, MouseBtn, Script};
+use crate::eval::{self, eval_truth};
+use crate::model::{Action, ActionKind, MouseBtn, Script};
 use crate::vision;
 use enigo::{Button, Direction, Enigo, Key, Keyboard, Mouse, Settings};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Playback outlives individual mutex guards; a poisoned lock must degrade to
+/// the guarded data instead of cascading panics across the UI and the engine.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Clone, Debug)]
 pub struct LogLine {
@@ -23,12 +31,64 @@ pub enum RunState {
     Paused,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunMode {
+    Full,
+    #[cfg_attr(not(test), allow(dead_code))]
+    Logic,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct RunReport {
+    pub ok: bool,
+    pub vars: HashMap<String, String>,
+    pub logs: Vec<LogLine>,
+}
+
+struct RunEnv<'a> {
+    speed: f32,
+    stop: &'a AtomicBool,
+    pause: &'a AtomicBool,
+    current: &'a AtomicUsize,
+    log: &'a Mutex<Vec<LogLine>>,
+    script_dir: Option<&'a Path>,
+    mode: RunMode,
+    depth: u32,
+    state: Option<&'a Mutex<RunState>>,
+    step_once: Option<&'a AtomicBool>,
+    step_over: Option<&'a AtomicBool>,
+    step_over_floor: Option<&'a AtomicUsize>,
+    /// Child scripts parsed once per run (PlayScript inside loops re-reads).
+    scripts: &'a RefCell<HashMap<PathBuf, Option<Arc<Script>>>>,
+}
+
+/// Keep the log dialog responsive on long Infinite runs.
+const LOG_CAP: usize = 1000;
+
+fn push_line(log: &Mutex<Vec<LogLine>>, text: impl Into<String>) {
+    let mut log = lock(log);
+    log.push(LogLine {
+        time: chrono::Local::now().format("%H:%M:%S").to_string(),
+        text: text.into(),
+    });
+    if log.len() > LOG_CAP + 200 {
+        let excess = log.len() - LOG_CAP;
+        log.drain(0..excess);
+    }
+}
+
 pub struct Engine {
     pub state: Arc<Mutex<RunState>>,
     pub stop: Arc<AtomicBool>,
     pub pause: Arc<AtomicBool>,
     pub current: Arc<AtomicUsize>,
     pub log: Arc<Mutex<Vec<LogLine>>>,
+    pub step_once: Arc<AtomicBool>,
+    pub step_over: Arc<AtomicBool>,
+    pub step_over_floor: Arc<AtomicUsize>,
+    /// Outcome of the last run: false when it aborted (stop, failure, panic).
+    last_ok: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -39,11 +99,15 @@ impl Engine {
             pause: Arc::new(AtomicBool::new(false)),
             current: Arc::new(AtomicUsize::new(0)),
             log: Arc::new(Mutex::new(Vec::new())),
+            step_once: Arc::new(AtomicBool::new(false)),
+            step_over: Arc::new(AtomicBool::new(false)),
+            step_over_floor: Arc::new(AtomicUsize::new(usize::MAX)),
+            last_ok: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub fn snapshot_state(&self) -> RunState {
-        *self.state.lock().unwrap()
+        *lock(&self.state)
     }
 
     pub fn current_index(&self) -> usize {
@@ -51,19 +115,20 @@ impl Engine {
     }
 
     pub fn logs(&self) -> Vec<LogLine> {
-        self.log.lock().unwrap().clone()
+        lock(&self.log).clone()
     }
 
     pub fn clear_log(&self) {
-        self.log.lock().unwrap().clear();
+        lock(&self.log).clear()
+    }
+
+    /// True when the last completed run finished all rounds without aborting.
+    pub fn last_run_ok(&self) -> bool {
+        self.last_ok.load(Ordering::Relaxed)
     }
 
     fn push_log(&self, text: impl Into<String>) {
-        let now = chrono::Local::now().format("%H:%M:%S").to_string();
-        self.log.lock().unwrap().push(LogLine {
-            time: now,
-            text: text.into(),
-        });
+        push_line(&self.log, text);
     }
 
     pub fn request_stop(&self) {
@@ -72,6 +137,9 @@ impl Engine {
     }
 
     pub fn toggle_pause(&self) {
+        if self.snapshot_state() == RunState::Idle {
+            return;
+        }
         let cur = self.pause.load(Ordering::Relaxed);
         self.pause.store(!cur, Ordering::Relaxed);
         if let Ok(mut s) = self.state.lock() {
@@ -83,6 +151,32 @@ impl Engine {
         }
     }
 
+    /// F7: run the current action, then pause (AMK Step Into).
+    pub fn request_step_into(&self) {
+        if self.snapshot_state() == RunState::Idle {
+            return;
+        }
+        self.step_once.store(true, Ordering::Relaxed);
+        self.pause.store(false, Ordering::Relaxed);
+        if let Ok(mut s) = self.state.lock() {
+            *s = RunState::Running;
+        }
+    }
+
+    /// F8: run the current action; if it is Call Function, do not pause
+    /// until that call returns (AMK Step Over).
+    pub fn request_step_over(&self) {
+        if self.snapshot_state() == RunState::Idle {
+            return;
+        }
+        self.step_over.store(true, Ordering::Relaxed);
+        self.step_over_floor.store(usize::MAX, Ordering::Relaxed);
+        self.pause.store(false, Ordering::Relaxed);
+        if let Ok(mut s) = self.state.lock() {
+            *s = RunState::Running;
+        }
+    }
+
     pub fn play(
         &self,
         script: Script,
@@ -90,66 +184,226 @@ impl Engine {
         times: u32,
         duration_secs: Option<u64>,
         script_dir: Option<std::path::PathBuf>,
+        start_paused: bool,
     ) {
         if self.snapshot_state() != RunState::Idle {
             return;
         }
         self.stop.store(false, Ordering::Relaxed);
-        self.pause.store(false, Ordering::Relaxed);
-        *self.state.lock().unwrap() = RunState::Running;
+        self.step_once.store(false, Ordering::Relaxed);
+        self.step_over.store(false, Ordering::Relaxed);
+        self.step_over_floor.store(usize::MAX, Ordering::Relaxed);
+        self.pause.store(start_paused, Ordering::Relaxed);
+        self.current.store(0, Ordering::Relaxed);
+        self.last_ok.store(true, Ordering::Relaxed);
+        *lock(&self.state) = if start_paused {
+            RunState::Paused
+        } else {
+            RunState::Running
+        };
         self.clear_log();
-        self.push_log("Play started");
+        self.push_log(if start_paused {
+            "Debug run — F7 step into, F8 step over, F12 stop"
+        } else {
+            "Play started"
+        });
 
         let state = self.state.clone();
         let stop = self.stop.clone();
         let pause = self.pause.clone();
         let current = self.current.clone();
         let log = self.log.clone();
+        let step_once = self.step_once.clone();
+        let step_over = self.step_over.clone();
+        let step_over_floor = self.step_over_floor.clone();
+        let last_ok = self.last_ok.clone();
 
         thread::spawn(move || {
             let start = Instant::now();
-            let mut round = 0u32;
-            loop {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                if let Some(d) = duration_secs {
-                    if start.elapsed().as_secs() >= d {
+            let scripts = RefCell::new(HashMap::new());
+            // A panic on this thread would otherwise leave RunState::Running
+            // forever (the only Idle reset lives here). Catch it, and report
+            // the run as aborted either way.
+            let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut round = 0u32;
+                let mut completed = true;
+                loop {
+                    if stop.load(Ordering::Relaxed) {
+                        completed = false;
                         break;
                     }
-                } else if times > 0 && round >= times {
-                    break;
+                    if let Some(d) = duration_secs {
+                        if start.elapsed().as_secs() >= d {
+                            break;
+                        }
+                    } else if times > 0 && round >= times {
+                        break;
+                    }
+                    round += 1;
+                    push_line(&log, format!("Round {}", round));
+                    let env = RunEnv {
+                        speed,
+                        stop: &stop,
+                        pause: &pause,
+                        current: &current,
+                        log: &log,
+                        script_dir: script_dir.as_deref(),
+                        mode: RunMode::Full,
+                        depth: 0,
+                        state: Some(&state),
+                        step_once: Some(&step_once),
+                        step_over: Some(&step_over),
+                        step_over_floor: Some(&step_over_floor),
+                        scripts: &scripts,
+                    };
+                    let (ok, _) = run_once(&script, &env, &HashMap::new());
+                    if !ok {
+                        completed = false;
+                        break;
+                    }
+                    if times == 1 && duration_secs.is_none() {
+                        break;
+                    }
                 }
-                round += 1;
-                {
-                    let mut lg = log.lock().unwrap();
-                    lg.push(LogLine {
-                        time: chrono::Local::now().format("%H:%M:%S").to_string(),
-                        text: format!("Round {}", round),
-                    });
-                }
-                if !run_once(
-                    &script,
-                    speed,
-                    &stop,
-                    &pause,
-                    &current,
-                    &log,
-                    script_dir.as_deref(),
-                ) {
-                    break;
-                }
-                if times == 1 && duration_secs.is_none() {
-                    break;
-                }
-            }
-            current.store(0, Ordering::Relaxed);
-            *state.lock().unwrap() = RunState::Idle;
-            log.lock().unwrap().push(LogLine {
-                time: chrono::Local::now().format("%H:%M:%S").to_string(),
-                text: "Play finished".into(),
+                completed
+            }))
+            .unwrap_or_else(|_| {
+                push_line(&log, "Play aborted by an internal error");
+                false
             });
+            current.store(0, Ordering::Relaxed);
+            last_ok.store(completed, Ordering::Relaxed);
+            // Log first: --run drains the log as soon as the state hits Idle.
+            push_line(&log, "Play finished");
+            *lock(&state) = RunState::Idle;
         });
+    }
+}
+
+/// Shipped runner without OS mouse/keyboard/GDI. Same control-flow and
+/// action dispatch as Play; delays are skipped so tests stay fast.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn run_logic(script: &Script) -> RunReport {
+    run_logic_in(script, None)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn run_logic_in(script: &Script, script_dir: Option<&Path>) -> RunReport {
+    let stop = AtomicBool::new(false);
+    let pause = AtomicBool::new(false);
+    let current = AtomicUsize::new(0);
+    let log = Mutex::new(Vec::new());
+    let scripts = RefCell::new(HashMap::new());
+    let env = RunEnv {
+        speed: 10.0,
+        stop: &stop,
+        pause: &pause,
+        current: &current,
+        log: &log,
+        script_dir,
+        mode: RunMode::Logic,
+        depth: 0,
+        state: None,
+        step_once: None,
+        step_over: None,
+        step_over_floor: None,
+        scripts: &scripts,
+    };
+    let (ok, vars) = run_once(script, &env, &HashMap::new());
+    RunReport {
+        ok,
+        vars,
+        logs: log.into_inner().unwrap_or_default(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StepDecision {
+    pause: bool,
+    new_floor: Option<usize>,
+    clear_step_over: bool,
+}
+
+/// AMK F7/F8: after one action, either pause (step into) or stay in a call (step over).
+fn step_decision(
+    step_once: bool,
+    step_over: bool,
+    kind_is_call: bool,
+    call_depth: usize,
+    floor: usize,
+) -> StepDecision {
+    if step_once {
+        return StepDecision {
+            pause: true,
+            new_floor: None,
+            clear_step_over: true,
+        };
+    }
+    if !step_over {
+        return StepDecision {
+            pause: false,
+            new_floor: None,
+            clear_step_over: false,
+        };
+    }
+    if kind_is_call && floor == usize::MAX {
+        return StepDecision {
+            pause: false,
+            new_floor: Some(call_depth.saturating_sub(1)),
+            clear_step_over: false,
+        };
+    }
+    if call_depth <= floor {
+        return StepDecision {
+            pause: true,
+            new_floor: None,
+            clear_step_over: true,
+        };
+    }
+    StepDecision {
+        pause: false,
+        new_floor: None,
+        clear_step_over: false,
+    }
+}
+
+fn debug_after_action(env: &RunEnv<'_>, kind_is_call: bool, call_depth: usize) {
+    if env.mode != RunMode::Full {
+        return;
+    }
+    let step_once = env
+        .step_once
+        .map(|f| f.load(Ordering::Relaxed))
+        .unwrap_or(false);
+    let step_over = env
+        .step_over
+        .map(|f| f.load(Ordering::Relaxed))
+        .unwrap_or(false);
+    let floor = env
+        .step_over_floor
+        .map(|f| f.load(Ordering::Relaxed))
+        .unwrap_or(usize::MAX);
+    let d = step_decision(step_once, step_over, kind_is_call, call_depth, floor);
+    if let Some(flag) = env.step_once {
+        flag.store(false, Ordering::Relaxed);
+    }
+    if let Some(nf) = d.new_floor {
+        if let Some(slot) = env.step_over_floor {
+            slot.store(nf, Ordering::Relaxed);
+        }
+    }
+    if d.clear_step_over {
+        if let Some(over) = env.step_over {
+            over.store(false, Ordering::Relaxed);
+        }
+    }
+    if d.pause {
+        env.pause.store(true, Ordering::Relaxed);
+        if let Some(st) = env.state {
+            if let Ok(mut s) = st.lock() {
+                *s = RunState::Paused;
+            }
+        }
     }
 }
 
@@ -195,26 +449,68 @@ fn fail_safe(enigo: &Enigo) -> bool {
     false
 }
 
+fn find_fn(actions: &[Action], name: &str) -> Option<usize> {
+    let want = name.trim();
+    if want.is_empty() {
+        return None;
+    }
+    actions
+        .iter()
+        .position(|a| matches!(a.kind, ActionKind::FunctionEntry) && a.name.trim() == want)
+}
+
+/// Nearest For/While loop around `from`: (opener index, matching End index).
+/// If/Else nesting is ignored on purpose: only loops own an End we can jump to.
+fn enclosing_loop(actions: &[Action], from: usize) -> Option<(usize, usize)> {
+    let mut depth = 0i32;
+    let mut opener = None;
+    for j in (0..from).rev() {
+        match &actions[j].kind {
+            ActionKind::For { .. } | ActionKind::While { .. } => {
+                if depth == 0 {
+                    opener = Some(j);
+                    break;
+                }
+                depth -= 1;
+            }
+            ActionKind::EndFor | ActionKind::EndWhile => depth += 1,
+            _ => {}
+        }
+    }
+    let opener = opener?;
+    let mut depth = 0i32;
+    for (j, a) in actions.iter().enumerate().skip(opener) {
+        match &a.kind {
+            ActionKind::For { .. } | ActionKind::While { .. } => depth += 1,
+            ActionKind::EndFor | ActionKind::EndWhile => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((opener, j));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn run_once(
     script: &Script,
-    speed: f32,
-    stop: &AtomicBool,
-    pause: &AtomicBool,
-    current: &AtomicUsize,
-    log: &Mutex<Vec<LogLine>>,
-    script_dir: Option<&std::path::Path>,
-) -> bool {
-    let mut enigo = match Enigo::new(&Settings::default()) {
-        Ok(e) => e,
-        Err(err) => {
-            log.lock().unwrap().push(LogLine {
-                time: chrono::Local::now().format("%H:%M:%S").to_string(),
-                text: format!("Enigo init failed: {err}"),
-            });
-            return false;
+    env: &RunEnv<'_>,
+    seed: &HashMap<String, String>,
+) -> (bool, HashMap<String, String>) {
+    let mut vars = seed.clone();
+    let mut enigo = if env.mode == RunMode::Full {
+        match Enigo::new(&Settings::default()) {
+            Ok(e) => Some(e),
+            Err(err) => {
+                push_line(env.log, format!("Enigo init failed: {err}"));
+                return (false, vars);
+            }
         }
+    } else {
+        None
     };
-    let mut vars: HashMap<String, String> = HashMap::new();
     let actions = &script.actions;
     let n = actions.len();
     let mut labels: HashMap<String, usize> = HashMap::new();
@@ -225,28 +521,49 @@ fn run_once(
     }
     let mut skip_depth: i32 = 0;
     let mut i = 0usize;
-    let mut for_stack: Vec<(usize, String, i64, i64)> = Vec::new();
+    // start, var, next_value, to, step
+    let mut for_stack: Vec<(usize, String, i64, i64, i64)> = Vec::new();
     let mut while_stack: Vec<usize> = Vec::new();
+    let mut call_stack: Vec<usize> = Vec::new();
+    let mut steps = 0u32;
 
     while i < n {
-        if stop.load(Ordering::Relaxed) {
-            return false;
+        steps += 1;
+        if steps > 1_000_000 {
+            push_line(
+                env.log,
+                "Stopped: iteration limit (possible infinite Goto/While)",
+            );
+            return (false, vars);
         }
-        if !wait_pause(pause, stop) {
-            return false;
+        if env.stop.load(Ordering::Relaxed) {
+            return (false, vars);
         }
-        current.store(i, Ordering::Relaxed);
-        if fail_safe(&enigo) {
-            log.lock().unwrap().push(LogLine {
-                time: chrono::Local::now().format("%H:%M:%S").to_string(),
-                text: "Fail-safe: top-left corner — stop".into(),
-            });
-            return false;
+        if env.mode == RunMode::Full && !wait_pause(env.pause, env.stop) {
+            return (false, vars);
+        }
+        env.current.store(i, Ordering::Relaxed);
+        if env.mode == RunMode::Full {
+            if let Some(e) = enigo.as_ref() {
+                if fail_safe(e) {
+                    push_line(env.log, "Fail-safe: top-left corner — stop");
+                    return (false, vars);
+                }
+            }
         }
         let a = &actions[i];
         if !a.enabled {
             i += 1;
             continue;
+        }
+
+        // delay_ms is the gap before this step (filled by the recorder).
+        if a.delay_ms > 0
+            && skip_depth == 0
+            && env.mode == RunMode::Full
+            && !sleep_scaled(a.delay_ms, env.speed, env.pause, env.stop)
+        {
+            return (false, vars);
         }
 
         match &a.kind {
@@ -272,10 +589,17 @@ fn run_once(
             ActionKind::EndFor => {
                 if skip_depth > 0 {
                     skip_depth -= 1;
-                } else if let Some((start, var, next, to)) = for_stack.pop() {
-                    if next <= to {
+                } else if let Some((start, var, next, to, st)) = for_stack.pop() {
+                    let in_range = if st >= 0 { next <= to } else { next >= to };
+                    if in_range {
                         vars.insert(var.clone(), next.to_string());
-                        for_stack.push((start, var, next + 1, to));
+                        push_line(env.log, format!("For {var}={next}"));
+                        // An overflowed continuation is out of range anyway:
+                        // dropping the frame ends the loop correctly.
+                        if let Some(nxt) = next.checked_add(st) {
+                            for_stack.push((start, var, nxt, to, st));
+                        }
+                        debug_after_action(env, false, call_stack.len());
                         i = start + 1;
                         continue;
                     }
@@ -287,6 +611,7 @@ fn run_once(
                 } else if let Some(start) = while_stack.last().copied() {
                     if let ActionKind::While { expr } = &actions[start].kind {
                         if eval_truth(expr, &vars) {
+                            debug_after_action(env, false, call_stack.len());
                             i = start + 1;
                             continue;
                         }
@@ -303,11 +628,16 @@ fn run_once(
                 if skip_depth > 0 {
                     skip_depth += 1;
                 } else {
-                    let st = *step;
-                    let nxt = *from + if st == 0 { 1 } else { st };
-                    vars.insert(var.clone(), from.to_string());
-                    if (*from <= *to && st >= 0) || (*from >= *to && st < 0) {
-                        for_stack.push((i, var.clone(), nxt, *to));
+                    let st = if *step == 0 { 1 } else { *step };
+                    let in_range = if st >= 0 { *from <= *to } else { *from >= *to };
+                    if in_range {
+                        vars.insert(var.clone(), from.to_string());
+                        push_line(env.log, format!("For {var}={from}"));
+                        if let Some(nxt) = (*from).checked_add(st) {
+                            for_stack.push((i, var.clone(), nxt, *to, st));
+                        }
+                        // No frame on overflow: the loop body runs once and
+                        // the EndFor below falls through.
                     } else {
                         skip_depth = 1;
                     }
@@ -322,55 +652,133 @@ fn run_once(
                     while_stack.push(i);
                 }
             }
+            ActionKind::FunctionEntry => {}
+            ActionKind::EndFunction => {
+                if skip_depth == 0 {
+                    if let Some(ret) = call_stack.pop() {
+                        i = ret;
+                    } else {
+                        return (true, vars);
+                    }
+                }
+            }
+            ActionKind::CallFunction { name } => {
+                if skip_depth == 0 {
+                    // Same variable support as Goto.
+                    let name = eval::expand_text(name, &vars);
+                    if call_stack.len() >= 32 {
+                        push_line(env.log, format!("Call {name}: depth limit"));
+                        return (false, vars);
+                    }
+                    if let Some(idx) = find_fn(actions, &name) {
+                        push_line(env.log, format!("Call {name}"));
+                        call_stack.push(i);
+                        i = idx;
+                    } else {
+                        push_line(env.log, format!("Call {name}: not found"));
+                    }
+                }
+            }
+            ActionKind::Break | ActionKind::Continue => {
+                if skip_depth == 0 {
+                    let is_break = matches!(a.kind, ActionKind::Break);
+                    match enclosing_loop(actions, i) {
+                        Some((opener, end)) => {
+                            if is_break {
+                                // Drop the loop frame so the End falls through
+                                // instead of starting the next iteration.
+                                if while_stack.last() == Some(&opener) {
+                                    while_stack.pop();
+                                } else if for_stack.last().map(|f| f.0) == Some(opener) {
+                                    for_stack.pop();
+                                }
+                            }
+                            // Land on the End itself (not past it): the End
+                            // drives the loop for Continue, and for Break its
+                            // empty stack falls through.
+                            i = end;
+                            continue;
+                        }
+                        None => push_line(
+                            env.log,
+                            if is_break {
+                                "Break: no loop"
+                            } else {
+                                "Continue: no loop"
+                            },
+                        ),
+                    }
+                }
+            }
             _ => {
                 if skip_depth > 0 {
                     i += 1;
                     continue;
                 }
-                if !exec_action(
-                    &mut enigo, a, &mut vars, &labels, &mut i, speed, pause, stop, log, script_dir,
-                ) {
-                    return false;
+                if !exec_action(&mut enigo, a, &mut vars, &labels, &mut i, env) {
+                    return (false, vars);
                 }
             }
         }
 
-        if a.delay_ms > 0 && skip_depth == 0 && !sleep_scaled(a.delay_ms, speed, pause, stop) {
-            return false;
+        if skip_depth == 0 {
+            debug_after_action(
+                env,
+                matches!(a.kind, ActionKind::CallFunction { .. }),
+                call_stack.len(),
+            );
         }
         i += 1;
     }
-    true
+    (true, vars)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn exec_action(
-    enigo: &mut Enigo,
-    a: &crate::model::Action,
+    enigo: &mut Option<Enigo>,
+    a: &Action,
     vars: &mut HashMap<String, String>,
     labels: &HashMap<String, usize>,
     i: &mut usize,
-    speed: f32,
-    pause: &AtomicBool,
-    stop: &AtomicBool,
-    log: &Mutex<Vec<LogLine>>,
-    script_dir: Option<&std::path::Path>,
+    env: &RunEnv<'_>,
 ) -> bool {
-    let push = |t: String| {
-        log.lock().unwrap().push(LogLine {
-            time: chrono::Local::now().format("%H:%M:%S").to_string(),
-            text: t,
-        });
-    };
+    let push = |t: String| push_line(env.log, t);
+    let live = env.mode == RunMode::Full;
     match &a.kind {
         ActionKind::FunctionEntry | ActionKind::EndFunction | ActionKind::Comment { .. } => {}
         ActionKind::Delay { ms } => {
-            if !sleep_scaled(*ms, speed, pause, stop) {
+            if live && !sleep_scaled(*ms, env.speed, env.pause, env.stop) {
                 return false;
             }
+            let _ = ms;
         }
-        ActionKind::MouseMove { x, y } => {
-            let _ = enigo.move_mouse(*x, *y, enigo::Coordinate::Abs);
+        ActionKind::MouseMove { x, y, ms } => {
+            if let Some(e) = enigo.as_mut() {
+                // Duration > 0 glides there AMK-style; 0 jumps as before.
+                let mut glided = false;
+                if *ms > 0 {
+                    if let Ok((cx, cy)) = e.location() {
+                        let steps = (*ms / 15).clamp(1, 100);
+                        let step_ms = (ms / steps).max(1);
+                        for s in 1..=steps {
+                            let t = s as f32 / steps as f32;
+                            let nx = cx as f32 + (*x - cx) as f32 * t;
+                            let ny = cy as f32 + (*y - cy) as f32 * t;
+                            let _ = e.move_mouse(
+                                nx.round() as i32,
+                                ny.round() as i32,
+                                enigo::Coordinate::Abs,
+                            );
+                            if s < steps && !sleep_scaled(step_ms, env.speed, env.pause, env.stop) {
+                                return false;
+                            }
+                        }
+                        glided = true;
+                    }
+                }
+                if !glided {
+                    let _ = e.move_mouse(*x, *y, enigo::Coordinate::Abs);
+                }
+            }
         }
         ActionKind::MouseClick {
             button,
@@ -378,11 +786,17 @@ fn exec_action(
             y,
             clicks,
         } => {
-            let _ = enigo.move_mouse(*x, *y, enigo::Coordinate::Abs);
-            let btn = map_btn(*button);
-            for _ in 0..(*clicks).max(1) {
-                let _ = enigo.button(btn, Direction::Click);
-                thread::sleep(Duration::from_millis(40));
+            if let Some(e) = enigo.as_mut() {
+                let _ = e.move_mouse(*x, *y, enigo::Coordinate::Abs);
+                let btn = map_btn(*button);
+                for _ in 0..(*clicks).max(1) {
+                    let _ = e.button(btn, Direction::Click);
+                    // Scaled, stop- and pause-aware: 255 clicks must not pin
+                    // the playback thread for 10 blind seconds.
+                    if !sleep_scaled(40, env.speed, env.pause, env.stop) {
+                        return false;
+                    }
+                }
             }
         }
         ActionKind::MouseDrag {
@@ -392,38 +806,77 @@ fn exec_action(
             x2,
             y2,
         } => {
-            let btn = map_btn(*button);
-            let _ = enigo.move_mouse(*x1, *y1, enigo::Coordinate::Abs);
-            let _ = enigo.button(btn, Direction::Press);
-            thread::sleep(Duration::from_millis(30));
-            let _ = enigo.move_mouse(*x2, *y2, enigo::Coordinate::Abs);
-            thread::sleep(Duration::from_millis(30));
-            let _ = enigo.button(btn, Direction::Release);
-        }
-        ActionKind::MouseWheel { delta } => {
-            let _ = enigo.scroll(*delta, enigo::Axis::Vertical);
-        }
-        ActionKind::TypeText { text, interval_ms } => {
-            for ch in text.chars() {
-                if stop.load(Ordering::Relaxed) {
+            if let Some(e) = enigo.as_mut() {
+                let btn = map_btn(*button);
+                let _ = e.move_mouse(*x1, *y1, enigo::Coordinate::Abs);
+                let _ = e.button(btn, Direction::Press);
+                if !sleep_scaled(30, env.speed, env.pause, env.stop) {
                     return false;
                 }
-                let _ = enigo.text(&ch.to_string());
-                if *interval_ms > 0 {
-                    thread::sleep(Duration::from_millis(*interval_ms));
+                let _ = e.move_mouse(*x2, *y2, enigo::Coordinate::Abs);
+                if !sleep_scaled(30, env.speed, env.pause, env.stop) {
+                    return false;
+                }
+                let _ = e.button(btn, Direction::Release);
+            }
+        }
+        ActionKind::MouseWheel { delta } => {
+            if let Some(e) = enigo.as_mut() {
+                let _ = e.scroll(*delta, enigo::Axis::Vertical);
+            }
+        }
+        ActionKind::TypeText { text, interval_ms } => {
+            let text = eval::expand_text(text, vars);
+            push(format!("TypeText {text}"));
+            if let Some(e) = enigo.as_mut() {
+                for ch in text.chars() {
+                    if env.stop.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    let _ = e.text(&ch.to_string());
+                    if *interval_ms > 0
+                        && !sleep_scaled(*interval_ms, env.speed, env.pause, env.stop)
+                    {
+                        return false;
+                    }
                 }
             }
         }
         ActionKind::KeyPress { key } => {
-            send_combo(enigo, key);
+            let key = eval::expand_text(key, vars);
+            push(format!("Key {key}"));
+            if let Some(e) = enigo.as_mut() {
+                send_combo(e, &key);
+            }
+        }
+        ActionKind::KeyDown { key } | ActionKind::KeyUp { key } => {
+            let down = matches!(a.kind, ActionKind::KeyDown { .. });
+            let key = eval::expand_text(key, vars);
+            push(format!("Key {} {key}", if down { "Down" } else { "Up" }));
+            if let Some(e) = enigo.as_mut() {
+                if let Some(k) = parse_key(&key) {
+                    let _ = e.key(
+                        k,
+                        if down {
+                            Direction::Press
+                        } else {
+                            Direction::Release
+                        },
+                    );
+                }
+            }
         }
         ActionKind::MouseDown { button, x, y } => {
-            let _ = enigo.move_mouse(*x, *y, enigo::Coordinate::Abs);
-            let _ = enigo.button(map_btn(*button), Direction::Press);
+            if let Some(e) = enigo.as_mut() {
+                let _ = e.move_mouse(*x, *y, enigo::Coordinate::Abs);
+                let _ = e.button(map_btn(*button), Direction::Press);
+            }
         }
         ActionKind::MouseUp { button, x, y } => {
-            let _ = enigo.move_mouse(*x, *y, enigo::Coordinate::Abs);
-            let _ = enigo.button(map_btn(*button), Direction::Release);
+            if let Some(e) = enigo.as_mut() {
+                let _ = e.move_mouse(*x, *y, enigo::Coordinate::Abs);
+                let _ = e.button(map_btn(*button), Direction::Release);
+            }
         }
         ActionKind::SmartClick {
             x,
@@ -434,22 +887,38 @@ fn exec_action(
             on_fail,
             ox,
             oy,
+            rw,
+            rh,
+            px,
+            py,
         } => {
-            if image.is_empty() {
+            let image = eval::expand_text(image, vars);
+            let hint = match (*px, *py) {
+                (Some(px), Some(py)) => Some((px, py)),
+                _ => Some((*x, *y)),
+            };
+            if !live {
+                push(format!("Smart Click ({x}, {y}) logic-skip"));
+            } else if image.is_empty() {
                 push(format!("Smart Click ({x}, {y}) no image — skip"));
-            } else if let Some(hit) = wait_match(
-                image,
-                Some((*x, *y)),
+            } else if let Some((hit, tw, th)) = wait_match(
+                &image,
+                hint,
                 *timeout_ms,
                 *confidence,
-                script_dir,
-                stop,
+                env.script_dir,
+                env.stop,
                 false,
+                match (*rw, *rh) {
+                    (Some(w), Some(h)) if w > 0 && h > 0 => Some((*x, *y, w, h)),
+                    _ => None,
+                },
             ) {
-                let cx = ox.unwrap_or(hit.2 / 2) + hit.0;
-                let cy = oy.unwrap_or(hit.3 / 2) + hit.1;
-                let _ = enigo.move_mouse(cx, cy, enigo::Coordinate::Abs);
-                let _ = enigo.button(Button::Left, Direction::Click);
+                let (cx, cy) = vision::click_on_match(hit, *ox, *oy, tw, th);
+                if let Some(e) = enigo.as_mut() {
+                    let _ = e.move_mouse(cx, cy, enigo::Coordinate::Abs);
+                    let _ = e.button(Button::Left, Direction::Click);
+                }
                 push(format!("Smart Click match @ {cx},{cy}"));
             } else {
                 push(format!("Smart Click no match `{image}`"));
@@ -466,18 +935,25 @@ fn exec_action(
             confidence,
             on_fail,
         } => {
-            if let Some(hit) = wait_match(
-                image,
+            let image = eval::expand_text(image, vars);
+            let save_x = eval::expand_text(save_x, vars);
+            let save_y = eval::expand_text(save_y, vars);
+            if !live {
+                vars.insert("found".into(), "notfound".into());
+                push(format!("Search Picture logic-skip `{image}`"));
+            } else if let Some((hit, _, _)) = wait_match(
+                &image,
                 None,
                 *timeout_ms,
                 *confidence,
-                script_dir,
-                stop,
+                env.script_dir,
+                env.stop,
                 true,
+                None,
             ) {
                 vars.insert("found".into(), "true".into());
-                vars.insert(save_x.clone(), hit.0.to_string());
-                vars.insert(save_y.clone(), hit.1.to_string());
+                vars.insert(save_x, hit.0.to_string());
+                vars.insert(save_y, hit.1.to_string());
                 vars.insert("found_x".into(), hit.0.to_string());
                 vars.insert("found_y".into(), hit.1.to_string());
                 push(format!("Search Picture found @ {},{}", hit.0, hit.1));
@@ -490,89 +966,234 @@ fn exec_action(
             }
         }
         ActionKind::WaitTime { hh, mm } => {
-            use chrono::Timelike;
-            let now = chrono::Local::now();
-            let target = (*hh as i64) * 3600 + (*mm as i64) * 60;
-            let cur = now.hour() as i64 * 3600 + now.minute() as i64 * 60 + now.second() as i64;
-            if target <= cur {
-                push("WaitTime missed".into());
+            if !live {
+                push(format!("WaitTime {:02}:{:02} logic-skip", hh, mm));
             } else {
-                let deadline = Instant::now() + Duration::from_secs((target - cur) as u64);
-                while Instant::now() < deadline {
-                    if stop.load(Ordering::Relaxed) {
+                use chrono::Timelike;
+                let now = chrono::Local::now();
+                match wait_seconds_until(now.hour(), now.minute(), now.second(), *hh, *mm) {
+                    None => push("WaitTime missed".into()),
+                    Some(0) => push(format!("WaitTime {:02}:{:02} now", hh, mm)),
+                    Some(secs) => {
+                        let deadline = Instant::now() + Duration::from_secs(secs);
+                        while Instant::now() < deadline {
+                            if env.stop.load(Ordering::Relaxed) {
+                                return false;
+                            }
+                            // Pausing must freeze the countdown, not skip it.
+                            if !wait_pause(env.pause, env.stop) {
+                                return false;
+                            }
+                            thread::sleep(Duration::from_millis(200));
+                        }
+                        push(format!("WaitTime {:02}:{:02}", hh, mm));
+                    }
+                }
+            }
+        }
+        ActionKind::RandomNumber { name, a, b } => {
+            let n = random_in_range(*a, *b, next_draw());
+            vars.insert(name.clone(), n.to_string());
+            push(format!("Random {name} = {n}"));
+        }
+        ActionKind::Command { cmd } => {
+            let cmd = eval::expand_text(cmd, vars);
+            push(format!("Command: {cmd}"));
+            if live && !cmd.is_empty() {
+                #[cfg(windows)]
+                {
+                    let _ = Command::new("cmd").args(["/C", &cmd]).status();
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = Command::new("sh").args(["-c", &cmd]).status();
+                }
+            }
+        }
+        ActionKind::ActivateWindow { title } => {
+            let title = eval::expand_text(title, vars);
+            if live {
+                let ok = window_command(&title, false);
+                push(format!(
+                    "Activate `{title}`: {}",
+                    if ok { "ok" } else { "not found" }
+                ));
+            }
+        }
+        ActionKind::CloseWindow { title } => {
+            let title = eval::expand_text(title, vars);
+            if live {
+                let ok = window_command(&title, true);
+                push(format!(
+                    "Close `{title}`: {}",
+                    if ok { "ok" } else { "not found" }
+                ));
+            }
+        }
+        ActionKind::WaitWindow {
+            title,
+            timeout_ms,
+            on_fail,
+        } => {
+            let title = eval::expand_text(title, vars);
+            if !live {
+                push(format!("Wait Window \"{title}\" logic-skip"));
+            } else {
+                let deadline = Instant::now() + Duration::from_millis(*timeout_ms);
+                loop {
+                    if env.stop.load(Ordering::Relaxed) {
                         return false;
+                    }
+                    if !wait_pause(env.pause, env.stop) {
+                        return false;
+                    }
+                    if window_exists(&title) {
+                        push(format!("Wait Window \"{title}\" found"));
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        push(format!("Wait Window \"{title}\" timeout"));
+                        if on_fail.eq_ignore_ascii_case("stop") {
+                            return false;
+                        }
+                        break;
                     }
                     thread::sleep(Duration::from_millis(200));
                 }
             }
         }
-        ActionKind::RandomNumber { name, a, b } => {
-            let lo = (*a).min(*b);
-            let hi = (*a).max(*b);
-            let span = (hi - lo + 1).max(1);
-            let tick = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(1);
-            let n = lo + (tick % span as u128) as i64;
-            vars.insert(name.clone(), n.to_string());
-            push(format!("Random {name} = {n}"));
-        }
-        ActionKind::Command { cmd } => {
-            if !cmd.is_empty() {
-                #[cfg(windows)]
-                {
-                    let _ = Command::new("cmd").args(["/C", cmd]).status();
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = Command::new("sh").args(["-c", cmd]).status();
-                }
+        ActionKind::SetClipboard { text } => {
+            let text = eval::expand_text(text, vars);
+            let shown: String = text.chars().take(40).collect();
+            push(format!("Set Clipboard \"{shown}\""));
+            if live && !crate::clipboard::set_text(&text) {
+                push("Set Clipboard failed".into());
             }
         }
-        ActionKind::ActivateWindow { title } => {
-            let ok = window_command(title, false);
-            push(format!(
-                "Activate `{title}`: {}",
-                if ok { "ok" } else { "sent" }
-            ));
-        }
-        ActionKind::CloseWindow { title } => {
-            let ok = window_command(title, true);
-            push(format!(
-                "Close `{title}`: {}",
-                if ok { "ok" } else { "sent" }
-            ));
+        ActionKind::GetClipboard { name } => {
+            if live {
+                match crate::clipboard::get_text() {
+                    Some(text) => {
+                        vars.insert(name.clone(), text);
+                        push(format!("Get Clipboard -> {name}"));
+                    }
+                    None => push(format!("Get Clipboard failed ({name})")),
+                }
+            } else {
+                push(format!("Get Clipboard {name} logic-skip"));
+            }
         }
         ActionKind::OpenFile { path } | ActionKind::OpenFolder { path } => {
-            open_path(path);
+            let path = eval::expand_text(path, vars);
+            if live {
+                open_path(&path);
+            }
         }
         ActionKind::OpenUrl { url } => {
-            open_path(url);
+            let url = eval::expand_text(url, vars);
+            if live {
+                open_path(&url);
+            }
         }
         ActionKind::SetVar { name, value } => {
-            vars.insert(name.clone(), value.clone());
+            let resolved = eval::eval_value(value, vars);
+            vars.insert(name.clone(), resolved.clone());
+            push(format!("SetVar {name}={resolved}"));
         }
         ActionKind::Label { .. } => {}
         ActionKind::Goto { name } => {
-            if let Some(idx) = labels.get(name) {
+            let name = eval::expand_text(name, vars);
+            if let Some(idx) = labels.get(&name) {
                 *i = *idx;
+            } else {
+                push(format!("Goto `{name}`: not found"));
             }
         }
         ActionKind::MessageBox { text } => {
+            let text = eval::expand_text(text, vars);
             push(format!("MessageBox: {text}"));
+            if live {
+                show_message_box(&text);
+            }
         }
         ActionKind::CallFunction { name } => {
             push(format!("Call {name}"));
         }
         ActionKind::PlayScript { path } => {
+            let path = eval::expand_text(path, vars);
             push(format!("Play script {path}"));
+            if env.depth >= 8 {
+                push("Play script depth limit".into());
+                return false;
+            }
+            let resolved = resolve_script_path(&path, env.script_dir);
+            // Parse each child once per run: a PlayScript inside a While loop
+            // must not re-read and re-parse the file on every iteration.
+            let child = {
+                let mut cache = env.scripts.borrow_mut();
+                match cache.entry(resolved.clone()) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        let parsed = std::fs::read_to_string(&resolved)
+                            .ok()
+                            .and_then(|s| Script::load_json(&s).ok())
+                            .map(Arc::new);
+                        e.insert(parsed).clone()
+                    }
+                }
+            };
+            match child {
+                Some(sc) => {
+                    let nested_dir = resolved.parent().map(|p| p.to_path_buf());
+                    let nested = RunEnv {
+                        speed: env.speed,
+                        stop: env.stop,
+                        pause: env.pause,
+                        current: env.current,
+                        log: env.log,
+                        script_dir: nested_dir.as_deref().or(env.script_dir),
+                        mode: env.mode,
+                        depth: env.depth + 1,
+                        state: env.state,
+                        step_once: env.step_once,
+                        step_over: env.step_over,
+                        step_over_floor: env.step_over_floor,
+                        scripts: env.scripts,
+                    };
+                    let (ok, child_vars) = run_once(&sc, &nested, vars);
+                    *vars = child_vars;
+                    if !ok {
+                        return false;
+                    }
+                }
+                None => {
+                    push(format!("Play script load failed: {path}"));
+                    return false;
+                }
+            }
         }
         _ => {}
     }
     true
 }
 
+fn resolve_script_path(path: &str, script_dir: Option<&Path>) -> PathBuf {
+    let p = PathBuf::from(path);
+    if p.is_file() {
+        return p;
+    }
+    if let Some(dir) = script_dir {
+        let c = dir.join(path);
+        if c.is_file() {
+            return c;
+        }
+    }
+    p
+}
+
+type MatchAt = ((i32, i32, i32, i32), i32, i32);
+
+#[allow(clippy::too_many_arguments)]
 fn wait_match(
     image: &str,
     prefer: Option<(i32, i32)>,
@@ -581,9 +1202,12 @@ fn wait_match(
     script_dir: Option<&std::path::Path>,
     stop: &AtomicBool,
     full_search: bool,
-) -> Option<(i32, i32, i32, i32)> {
+    region: Option<(i32, i32, i32, i32)>,
+) -> Option<MatchAt> {
     let path = vision::resolve_image(image, script_dir)?;
     let tmpl = vision::load_bmp24(&path)?;
+    let template_w = tmpl.w;
+    let template_h = tmpl.h;
     let once = vision::match_try_once(timeout_ms);
     let deadline = Instant::now() + Duration::from_millis(if once { 0 } else { timeout_ms });
     let mut pad = vision::smart_search_pad(tmpl.w, tmpl.h);
@@ -592,21 +1216,44 @@ fn wait_match(
             return None;
         }
         let t0 = Instant::now();
-        if let Some((px, py)) = prefer {
-            let x0 = (px - pad).max(0);
-            let y0 = (py - pad).max(0);
-            if let Some(local) = capture::grab_rect(x0, y0, tmpl.w + pad * 2, tmpl.h + pad * 2) {
-                if let Some(hit) =
-                    vision::find_template(&local, &tmpl, confidence, Some((px - x0, py - y0)))
-                {
-                    return Some((hit.0 + x0, hit.1 + y0, hit.2, hit.3));
+        if let Some((rx, ry, rw, rh)) = region {
+            if let Some(local) = capture::grab_rect(rx, ry, rw, rh) {
+                let pref = prefer.map(|(px, py)| (px - rx, py - ry));
+                if let Some(hit) = vision::find_template(&local, &tmpl, confidence, pref) {
+                    return Some((
+                        (hit.0 + rx, hit.1 + ry, hit.2, hit.3),
+                        template_w,
+                        template_h,
+                    ));
                 }
             }
-        }
-        if full_search {
-            if let Some(screen) = capture::grab_screen() {
-                if let Some(hit) = vision::find_template(&screen, &tmpl, confidence, prefer) {
-                    return Some(hit);
+        } else {
+            if let Some((px, py)) = prefer {
+                let x0 = (px - pad).max(0);
+                let y0 = (py - pad).max(0);
+                if let Some(local) = capture::grab_rect(x0, y0, tmpl.w + pad * 2, tmpl.h + pad * 2)
+                {
+                    if let Some(hit) =
+                        vision::find_template(&local, &tmpl, confidence, Some((px - x0, py - y0)))
+                    {
+                        return Some((
+                            (hit.0 + x0, hit.1 + y0, hit.2, hit.3),
+                            template_w,
+                            template_h,
+                        ));
+                    }
+                }
+            }
+            if full_search {
+                if let Some((screen, sx, sy)) = capture::grab_screen() {
+                    let pref = prefer.map(|(px, py)| (px - sx, py - sy));
+                    if let Some(hit) = vision::find_template(&screen, &tmpl, confidence, pref) {
+                        return Some((
+                            (hit.0 + sx, hit.1 + sy, hit.2, hit.3),
+                            template_w,
+                            template_h,
+                        ));
+                    }
                 }
             }
         }
@@ -689,34 +1336,286 @@ fn parse_key(s: &str) -> Option<Key> {
         "f10" => Key::F10,
         "f11" => Key::F11,
         "f12" => Key::F12,
-        _ => return None,
+        other => {
+            if let Some(rest) = other.strip_prefix("vk") {
+                if let Ok(vk) = rest.parse::<u32>() {
+                    return Some(Key::Other(vk));
+                }
+            }
+            if other.chars().count() == 1 {
+                let c = other.chars().next()?;
+                #[cfg(windows)]
+                {
+                    return Some(match c.to_ascii_uppercase() {
+                        'A' => Key::A,
+                        'B' => Key::B,
+                        'C' => Key::C,
+                        'D' => Key::D,
+                        'E' => Key::E,
+                        'F' => Key::F,
+                        'G' => Key::G,
+                        'H' => Key::H,
+                        'I' => Key::I,
+                        'J' => Key::J,
+                        'K' => Key::K,
+                        'L' => Key::L,
+                        'M' => Key::M,
+                        'N' => Key::N,
+                        'O' => Key::O,
+                        'P' => Key::P,
+                        'Q' => Key::Q,
+                        'R' => Key::R,
+                        'S' => Key::S,
+                        'T' => Key::T,
+                        'U' => Key::U,
+                        'V' => Key::V,
+                        'W' => Key::W,
+                        'X' => Key::X,
+                        'Y' => Key::Y,
+                        'Z' => Key::Z,
+                        '0' => Key::Num0,
+                        '1' => Key::Num1,
+                        '2' => Key::Num2,
+                        '3' => Key::Num3,
+                        '4' => Key::Num4,
+                        '5' => Key::Num5,
+                        '6' => Key::Num6,
+                        '7' => Key::Num7,
+                        '8' => Key::Num8,
+                        '9' => Key::Num9,
+                        _ => Key::Unicode(c),
+                    });
+                }
+                #[cfg(not(windows))]
+                {
+                    return Some(Key::Unicode(c));
+                }
+            }
+            return None;
+        }
     })
 }
 
-fn window_command(title: &str, close: bool) -> bool {
-    if title.trim().is_empty() {
+fn show_message_box(text: &str) {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        let title: Vec<u16> = OsStr::new("Automatic Mouse and Keyboard")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let body: Vec<u16> = OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            MessageBoxW(std::ptr::null_mut(), body.as_ptr(), title.as_ptr(), 0);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("MessageBox: {text}");
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBoxW(
+        hwnd: *mut core::ffi::c_void,
+        text: *const u16,
+        caption: *const u16,
+        ty: u32,
+    ) -> i32;
+}
+
+/// Seconds to wait until `hh:mm`. `Some(0)` when that minute is already the
+/// current one. `None` when the minute has passed or the clock is invalid.
+fn wait_seconds_until(hour: u32, minute: u32, second: u32, hh: u32, mm: u32) -> Option<u64> {
+    if hh > 23 || mm > 59 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let now = hour as u64 * 3600 + minute as u64 * 60 + second as u64;
+    let target = hh as u64 * 3600 + mm as u64 * 60;
+    if now < target {
+        Some(target - now)
+    } else if now < target + 60 {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// Inclusive range. `draw` picks a slot; values are spread across the whole span.
+pub fn random_in_range(lo: i64, hi: i64, draw: u64) -> i64 {
+    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+    let span = (hi as i128) - (lo as i128) + 1;
+    if span <= 1 {
+        return lo;
+    }
+    let span = span as u128;
+    let zone = u128::MAX - (u128::MAX % span);
+    let mut x = draw as u128;
+    for _ in 0..4 {
+        if x < zone {
+            return (lo as i128 + (x % span) as i128) as i64;
+        }
+        x = x
+            .wrapping_add(0x9E3779B97F4A7C15)
+            .wrapping_mul(0xBF58476D1CE4E5B9);
+    }
+    (lo as i128 + (draw as u128 % span) as i128) as i64
+}
+
+fn next_draw() -> u64 {
+    use std::sync::atomic::AtomicU64;
+    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut z = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn title_matches(window: &str, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
         return false;
     }
-    let safe = title.replace('\'', "''").replace('"', "");
-    #[cfg(target_os = "windows")]
-    {
-        let script = if close {
-            format!(
-                "$w = Get-Process | Where-Object {{ $_.MainWindowTitle -like '*{safe}*' }} | Select-Object -First 1; if ($w) {{ $w.CloseMainWindow() | Out-Null }}"
-            )
-        } else {
-            format!("(New-Object -ComObject WScript.Shell).AppActivate('{safe}')")
-        };
-        Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
-            .spawn()
-            .is_ok()
+    window.to_lowercase().contains(&query.to_lowercase())
+}
+
+fn window_command(title: &str, close: bool) -> bool {
+    let title = title.trim();
+    if title.is_empty() {
+        return false;
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(windows)]
     {
-        let _ = (close, safe);
+        window_action(title, if close { 2 } else { 1 })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = close;
         false
     }
+}
+
+/// True when a visible window title contains `query`.
+fn window_exists(query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        window_action(query, 0)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(windows)]
+struct WinHit {
+    query: String,
+    /// 0 = find only, 1 = activate, 2 = close.
+    action: u8,
+    found: bool,
+}
+
+#[cfg(windows)]
+fn window_action(query: &str, action: u8) -> bool {
+    let mut hit = WinHit {
+        query: query.to_string(),
+        action,
+        found: false,
+    };
+    unsafe {
+        EnumWindows(enum_top_window, &mut hit as *mut WinHit as isize);
+    }
+    hit.found
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn enum_top_window(hwnd: *mut core::ffi::c_void, lp: isize) -> i32 {
+    if lp == 0 {
+        return 0;
+    }
+    let hit = unsafe { &mut *(lp as *mut WinHit) };
+    unsafe {
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let mut buf = [0u16; 512];
+        let n = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if n <= 0 {
+            return 1;
+        }
+        let title = String::from_utf16_lossy(&buf[..n as usize]);
+        if !title_matches(&title, &hit.query) {
+            return 1;
+        }
+        hit.found = true;
+        match hit.action {
+            0 => return 0,
+            1 => bring_to_front(hwnd),
+            _ => {
+                PostMessageW(hwnd, 0x0010, 0, 0);
+            }
+        }
+    }
+    0
+}
+
+#[cfg(windows)]
+fn bring_to_front(hwnd: *mut core::ffi::c_void) {
+    unsafe {
+        let fg = GetForegroundWindow();
+        let cur = GetCurrentThreadId();
+        let fg_thread = GetWindowThreadProcessId(fg, std::ptr::null_mut());
+        let dst_thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        let attach_fg = fg_thread != 0 && fg_thread != cur;
+        let attach_dst = dst_thread != 0 && dst_thread != cur && dst_thread != fg_thread;
+        if attach_fg {
+            AttachThreadInput(cur, fg_thread, 1);
+        }
+        if attach_dst {
+            AttachThreadInput(cur, dst_thread, 1);
+        }
+        ShowWindow(hwnd, 9);
+        SetForegroundWindow(hwnd);
+        if attach_dst {
+            AttachThreadInput(cur, dst_thread, 0);
+        }
+        if attach_fg {
+            AttachThreadInput(cur, fg_thread, 0);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "user32")]
+extern "system" {
+    fn EnumWindows(
+        cb: unsafe extern "system" fn(*mut core::ffi::c_void, isize) -> i32,
+        lparam: isize,
+    ) -> i32;
+    fn GetWindowTextW(hwnd: *mut core::ffi::c_void, buf: *mut u16, max: i32) -> i32;
+    fn IsWindowVisible(hwnd: *mut core::ffi::c_void) -> i32;
+    fn SetForegroundWindow(hwnd: *mut core::ffi::c_void) -> i32;
+    fn ShowWindow(hwnd: *mut core::ffi::c_void, cmd: i32) -> i32;
+    fn PostMessageW(hwnd: *mut core::ffi::c_void, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn GetForegroundWindow() -> *mut core::ffi::c_void;
+    fn GetWindowThreadProcessId(hwnd: *mut core::ffi::c_void, pid: *mut u32) -> u32;
+    fn AttachThreadInput(from: u32, to: u32, attach: i32) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentThreadId() -> u32;
 }
 
 fn open_path(path: &str) {
@@ -731,5 +1630,692 @@ fn open_path(path: &str) {
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
         let _ = Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Action, ActionKind, Script};
+
+    fn kinds(ks: Vec<ActionKind>) -> Script {
+        Script {
+            version: "1.0".into(),
+            name: "t".into(),
+            actions: ks.into_iter().map(Action::new).collect(),
+        }
+    }
+
+    fn texts(r: &RunReport) -> Vec<String> {
+        r.logs.iter().map(|l| l.text.clone()).collect()
+    }
+
+    #[test]
+    fn for_step_two_visits_odd_values_only() {
+        let sc = kinds(vec![
+            ActionKind::For {
+                var: "i".into(),
+                from: 1,
+                to: 5,
+                step: 2,
+            },
+            ActionKind::Delay { ms: 0 },
+            ActionKind::EndFor,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        let t = texts(&r);
+        assert!(t.iter().any(|s| s == "For i=1"), "{t:?}");
+        assert!(t.iter().any(|s| s == "For i=3"), "{t:?}");
+        assert!(t.iter().any(|s| s == "For i=5"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "For i=2"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "For i=4"), "{t:?}");
+        assert_eq!(r.vars.get("i").map(String::as_str), Some("5"));
+    }
+
+    #[test]
+    fn for_negative_step_counts_down() {
+        let sc = kinds(vec![
+            ActionKind::For {
+                var: "i".into(),
+                from: 5,
+                to: 1,
+                step: -1,
+            },
+            ActionKind::EndFor,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        let t = texts(&r);
+        assert_eq!(
+            t.iter()
+                .filter(|s| s.starts_with("For i="))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "For i=5".to_string(),
+                "For i=4".to_string(),
+                "For i=3".to_string(),
+                "For i=2".to_string(),
+                "For i=1".to_string(),
+            ]
+        );
+        assert_eq!(r.vars.get("i").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn for_with_unrepresentable_continuation_runs_once_and_terminates() {
+        // from == to == i64::MAX with step 1: the body must run exactly once
+        // (from + 1 overflows) instead of panicking or looping forever.
+        let sc = kinds(vec![
+            ActionKind::For {
+                var: "i".into(),
+                from: i64::MAX,
+                to: i64::MAX,
+                step: 1,
+            },
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "1".into(),
+            },
+            ActionKind::EndFor,
+            ActionKind::SetVar {
+                name: "after".into(),
+                value: "yes".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        let max_s = i64::MAX.to_string();
+        assert_eq!(r.vars.get("i").map(String::as_str), Some(max_s.as_str()));
+        assert_eq!(r.vars.get("x").map(String::as_str), Some("1"));
+        assert_eq!(r.vars.get("after").map(String::as_str), Some("yes"));
+        assert_eq!(
+            texts(&r).iter().filter(|s| s.starts_with("For i=")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn break_exits_the_enclosing_loop_early() {
+        let sc = kinds(vec![
+            ActionKind::For {
+                var: "i".into(),
+                from: 1,
+                to: 10,
+                step: 1,
+            },
+            ActionKind::If {
+                expr: "i == 3".into(),
+            },
+            ActionKind::Break,
+            ActionKind::EndIf,
+            ActionKind::EndFor,
+            ActionKind::SetVar {
+                name: "after".into(),
+                value: "yes".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("i").map(String::as_str), Some("3"));
+        assert_eq!(r.vars.get("after").map(String::as_str), Some("yes"));
+        let t = texts(&r);
+        assert!(t.iter().any(|s| s == "For i=3"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "For i=4"), "{t:?}");
+    }
+
+    #[test]
+    fn continue_skips_only_the_current_iteration() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "0".into(),
+            },
+            ActionKind::For {
+                var: "i".into(),
+                from: 1,
+                to: 4,
+                step: 1,
+            },
+            ActionKind::If {
+                expr: "i == 2".into(),
+            },
+            ActionKind::Continue,
+            ActionKind::EndIf,
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "n + 1".into(),
+            },
+            ActionKind::EndFor,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("n").map(String::as_str), Some("3"));
+        assert_eq!(r.vars.get("i").map(String::as_str), Some("4"));
+    }
+
+    #[test]
+    fn break_in_inner_loop_leaves_the_outer_loop_running() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "rounds".into(),
+                value: "0".into(),
+            },
+            ActionKind::While {
+                expr: "true".into(),
+            },
+            ActionKind::For {
+                var: "i".into(),
+                from: 1,
+                to: 5,
+                step: 1,
+            },
+            ActionKind::If {
+                expr: "i == 2".into(),
+            },
+            ActionKind::Break,
+            ActionKind::EndIf,
+            ActionKind::EndFor,
+            ActionKind::SetVar {
+                name: "rounds".into(),
+                value: "rounds + 1".into(),
+            },
+            ActionKind::If {
+                expr: "rounds == 2".into(),
+            },
+            ActionKind::Break,
+            ActionKind::EndIf,
+            ActionKind::EndWhile,
+            ActionKind::SetVar {
+                name: "done".into(),
+                value: "1".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("rounds").map(String::as_str), Some("2"));
+        assert_eq!(r.vars.get("done").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn break_without_a_loop_is_logged_and_does_not_stop() {
+        let sc = kinds(vec![
+            ActionKind::Break,
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "1".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("x").map(String::as_str), Some("1"));
+        assert!(texts(&r).iter().any(|s| s.contains("no loop")));
+    }
+
+    #[test]
+    fn new_amk_actions_log_in_logic_mode() {
+        let sc = kinds(vec![
+            ActionKind::KeyDown {
+                key: "Shift".into(),
+            },
+            ActionKind::KeyUp {
+                key: "Shift".into(),
+            },
+            ActionKind::SetClipboard {
+                text: "hello".into(),
+            },
+            ActionKind::GetClipboard {
+                name: "clip".into(),
+            },
+            ActionKind::WaitWindow {
+                title: "Notepad".into(),
+                timeout_ms: 0,
+                on_fail: "stop".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        let t = texts(&r);
+        assert!(t.iter().any(|s| s.contains("Key Down Shift")), "{t:?}");
+        assert!(t.iter().any(|s| s.contains("Key Up Shift")), "{t:?}");
+        assert!(t.iter().any(|s| s.contains("Set Clipboard")), "{t:?}");
+        assert!(t.iter().any(|s| s.contains("Get Clipboard")), "{t:?}");
+        assert!(t.iter().any(|s| s.contains("Wait Window")), "{t:?}");
+    }
+
+    #[test]
+    fn mouse_move_json_without_ms_still_loads() {
+        // Backward compatibility: scripts written before the ms field.
+        let s = r#"{"kind":{"MouseMove":{"x":7,"y":9}}}"#;
+        let v: serde_json::Value = serde_json::from_str(s).unwrap();
+        let k: ActionKind = serde_json::from_value(v.get("kind").unwrap().clone()).unwrap();
+        assert!(matches!(k, ActionKind::MouseMove { x: 7, y: 9, ms: 0 }));
+    }
+
+    #[test]
+    fn if_false_skips_body_else_runs() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "0".into(),
+            },
+            ActionKind::If {
+                expr: "false".into(),
+            },
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "1".into(),
+            },
+            ActionKind::Else,
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "2".into(),
+            },
+            ActionKind::EndIf,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("x").map(String::as_str), Some("2"));
+        let t = texts(&r);
+        assert!(t.iter().any(|s| s == "SetVar x=2"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "SetVar x=1"), "{t:?}");
+    }
+
+    #[test]
+    fn if_true_runs_body_skips_else() {
+        let sc = kinds(vec![
+            ActionKind::If {
+                expr: "true".into(),
+            },
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "yes".into(),
+            },
+            ActionKind::Else,
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "no".into(),
+            },
+            ActionKind::EndIf,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok);
+        assert_eq!(r.vars.get("x").map(String::as_str), Some("yes"));
+        assert!(!texts(&r).iter().any(|s| s == "SetVar x=no"));
+    }
+
+    #[test]
+    fn while_stops_when_expression_is_false() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "1".into(),
+            },
+            ActionKind::While {
+                expr: "n == 1".into(),
+            },
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "0".into(),
+            },
+            ActionKind::SetVar {
+                name: "hit".into(),
+                value: "1".into(),
+            },
+            ActionKind::EndWhile,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("n").map(String::as_str), Some("0"));
+        assert_eq!(r.vars.get("hit").map(String::as_str), Some("1"));
+        let hits = texts(&r).iter().filter(|s| *s == "SetVar hit=1").count();
+        assert_eq!(hits, 1, "while must run the body once, not hang");
+    }
+
+    #[test]
+    fn goto_jumps_to_named_label() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "a".into(),
+                value: "1".into(),
+            },
+            ActionKind::Goto {
+                name: "skip".into(),
+            },
+            ActionKind::SetVar {
+                name: "a".into(),
+                value: "2".into(),
+            },
+            ActionKind::Label {
+                name: "skip".into(),
+            },
+            ActionKind::SetVar {
+                name: "b".into(),
+                value: "1".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("a").map(String::as_str), Some("1"));
+        assert_eq!(r.vars.get("b").map(String::as_str), Some("1"));
+        assert!(!texts(&r).iter().any(|s| s == "SetVar a=2"));
+    }
+
+    #[test]
+    fn call_function_jumps_to_named_function_entry_and_returns() {
+        let mut actions = vec![
+            Action::new(ActionKind::FunctionEntry),
+            Action::new(ActionKind::CallFunction { name: "foo".into() }),
+            Action::new(ActionKind::SetVar {
+                name: "after".into(),
+                value: "1".into(),
+            }),
+            Action::new(ActionKind::EndFunction),
+        ];
+        let mut foo = Action::new(ActionKind::FunctionEntry);
+        foo.name = "foo".into();
+        actions.push(foo);
+        actions.push(Action::new(ActionKind::SetVar {
+            name: "called".into(),
+            value: "1".into(),
+        }));
+        actions.push(Action::new(ActionKind::EndFunction));
+        let sc = Script {
+            version: "1.0".into(),
+            name: "t".into(),
+            actions,
+        };
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("called").map(String::as_str), Some("1"));
+        assert_eq!(r.vars.get("after").map(String::as_str), Some("1"));
+        assert!(texts(&r).iter().any(|s| s == "Call foo"), "{:?}", r.logs);
+    }
+
+    #[test]
+    fn play_script_loads_and_runs_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("amk_play_{}.amk", std::process::id()));
+        let child = r#"{
+          "version":"1.0","name":"child",
+          "actions":[
+            {"id":"c1","name":"set","enabled":true,"delay_ms":0,
+             "kind":{"SetVar":{"name":"nested","value":"yes"}}}
+          ]
+        }"#;
+        std::fs::write(&path, child).unwrap();
+        let sc = kinds(vec![ActionKind::PlayScript {
+            path: path.to_string_lossy().into_owned(),
+        }]);
+        let r = run_logic(&sc);
+        let _ = std::fs::remove_file(&path);
+        assert!(r.ok, "{:?}", r.logs);
+        let t = texts(&r);
+        assert!(t.iter().any(|s| s.starts_with("Play script ")), "{t:?}");
+        assert!(t.iter().any(|s| s == "SetVar nested=yes"), "{t:?}");
+    }
+
+    #[test]
+    fn message_box_logs_text_in_logic_mode() {
+        let sc = kinds(vec![ActionKind::MessageBox {
+            text: "hello-user".into(),
+        }]);
+        let r = run_logic(&sc);
+        assert!(r.ok);
+        assert!(texts(&r).iter().any(|s| s == "MessageBox: hello-user"));
+    }
+
+    #[test]
+    fn type_text_is_logged_without_moving_the_mouse() {
+        let sc = kinds(vec![ActionKind::TypeText {
+            text: "Xin chao tu AMK".into(),
+            interval_ms: 0,
+        }]);
+        let r = run_logic(&sc);
+        assert!(r.ok);
+        assert!(texts(&r).iter().any(|s| s.contains("Xin chao tu AMK")));
+    }
+
+    #[test]
+    fn parse_key_maps_letters_as_real_keys() {
+        assert!(parse_key("A").is_some());
+        assert!(parse_key("c").is_some());
+        assert!(parse_key("7").is_some());
+        assert!(parse_key("Enter").is_some());
+        assert!(parse_key("vk65").is_some());
+    }
+
+    #[test]
+    fn f7_step_into_pauses_after_the_action() {
+        let d = step_decision(true, false, false, 0, usize::MAX);
+        assert!(d.pause);
+        assert!(d.clear_step_over);
+    }
+
+    #[test]
+    fn f8_step_over_call_waits_until_return() {
+        let enter = step_decision(false, true, true, 1, usize::MAX);
+        assert!(!enter.pause);
+        assert_eq!(enter.new_floor, Some(0));
+        let inside = step_decision(false, true, false, 1, 0);
+        assert!(!inside.pause);
+        let ret = step_decision(false, true, false, 0, 0);
+        assert!(ret.pause);
+        assert!(ret.clear_step_over);
+    }
+
+    #[test]
+    fn f8_on_plain_action_pauses_immediately() {
+        let d = step_decision(false, true, false, 0, usize::MAX);
+        assert!(d.pause);
+    }
+
+    #[test]
+    fn nested_if_false_runs_else_not_inner_body() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "0".into(),
+            },
+            ActionKind::If {
+                expr: "false".into(),
+            },
+            ActionKind::If {
+                expr: "true".into(),
+            },
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "1".into(),
+            },
+            ActionKind::EndIf,
+            ActionKind::Else,
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "2".into(),
+            },
+            ActionKind::EndIf,
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("x").map(String::as_str), Some("2"));
+        assert!(!texts(&r).iter().any(|s| s == "SetVar x=1"));
+    }
+
+    #[test]
+    fn disabled_action_is_skipped() {
+        let mut sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "0".into(),
+            },
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "1".into(),
+            },
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "2".into(),
+            },
+        ]);
+        sc.actions[1].enabled = false;
+        let r = run_logic(&sc);
+        assert!(r.ok);
+        assert_eq!(r.vars.get("x").map(String::as_str), Some("2"));
+        assert!(!texts(&r).iter().any(|s| s == "SetVar x=1"));
+    }
+
+    #[test]
+    fn for_inside_false_if_does_not_run() {
+        let sc = kinds(vec![
+            ActionKind::If {
+                expr: "false".into(),
+            },
+            ActionKind::For {
+                var: "i".into(),
+                from: 1,
+                to: 3,
+                step: 1,
+            },
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "1".into(),
+            },
+            ActionKind::EndFor,
+            ActionKind::EndIf,
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "ok".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("x").map(String::as_str), Some("ok"));
+        assert!(!texts(&r).iter().any(|s| s.starts_with("For i=")));
+    }
+
+    #[test]
+    fn set_var_keeps_text_and_while_counts_with_addition() {
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "file".into(),
+                value: "hello-world".into(),
+            },
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "0".into(),
+            },
+            ActionKind::While {
+                expr: "n < 3".into(),
+            },
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "n + 1".into(),
+            },
+            ActionKind::EndWhile,
+            ActionKind::MessageBox {
+                text: "n={n} file={file}".into(),
+            },
+            ActionKind::TypeText {
+                text: "Hi {file}".into(),
+                interval_ms: 0,
+            },
+            ActionKind::Command {
+                cmd: "echo {n}".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("n").map(String::as_str), Some("3"));
+        assert_eq!(r.vars.get("file").map(String::as_str), Some("hello-world"));
+        let t = texts(&r);
+        assert!(
+            t.iter().any(|s| s == "MessageBox: n=3 file=hello-world"),
+            "{t:?}"
+        );
+        assert!(t.iter().any(|s| s == "TypeText Hi hello-world"), "{t:?}");
+        assert!(t.iter().any(|s| s == "Command: echo 3"), "{t:?}");
+    }
+
+    #[test]
+    fn play_script_shares_variables_with_the_caller() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("amk_share_{}.amk", std::process::id()));
+        let child = r#"{
+          "version":"1.0","name":"child",
+          "actions":[
+            {"id":"c1","name":"inc","enabled":true,"delay_ms":0,
+             "kind":{"SetVar":{"name":"n","value":"n + 1"}}},
+            {"id":"c2","name":"mark","enabled":true,"delay_ms":0,
+             "kind":{"SetVar":{"name":"extra","value":"child"}}}
+          ]
+        }"#;
+        std::fs::write(&path, child).unwrap();
+        let sc = kinds(vec![
+            ActionKind::SetVar {
+                name: "keep".into(),
+                value: "yes".into(),
+            },
+            ActionKind::SetVar {
+                name: "n".into(),
+                value: "1".into(),
+            },
+            ActionKind::PlayScript {
+                path: path.to_string_lossy().into_owned(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        let _ = std::fs::remove_file(&path);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("keep").map(String::as_str), Some("yes"));
+        assert_eq!(r.vars.get("n").map(String::as_str), Some("2"));
+        assert_eq!(r.vars.get("extra").map(String::as_str), Some("child"));
+    }
+
+    #[test]
+    fn goto_missing_label_is_logged_and_does_not_stop() {
+        let sc = kinds(vec![
+            ActionKind::Goto {
+                name: "missing".into(),
+            },
+            ActionKind::SetVar {
+                name: "x".into(),
+                value: "1".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        assert_eq!(r.vars.get("x").map(String::as_str), Some("1"));
+        assert!(texts(&r).iter().any(|s| s.contains("not found")));
+    }
+
+    #[test]
+    fn wait_time_treats_the_current_minute_as_already_due() {
+        assert_eq!(wait_seconds_until(9, 0, 30, 9, 0), Some(0));
+        assert_eq!(wait_seconds_until(8, 59, 58, 9, 0), Some(2));
+        assert_eq!(wait_seconds_until(9, 1, 0, 9, 0), None);
+        assert_eq!(wait_seconds_until(10, 0, 0, 25, 0), None);
+        assert_eq!(wait_seconds_until(10, 0, 0, 9, 60), None);
+    }
+
+    #[test]
+    fn random_stays_inside_inclusive_bounds() {
+        assert_eq!(random_in_range(4, 4, 99), 4);
+        assert_eq!(random_in_range(5, 1, 0), 1);
+        let mut seen = std::collections::HashSet::new();
+        for draw in 0..40 {
+            let n = random_in_range(3, 1, draw);
+            assert!((1..=3).contains(&n), "{n}");
+            seen.insert(n);
+        }
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
+    fn window_title_match_is_a_case_insensitive_part() {
+        assert!(title_matches("Untitled - Notepad", "notepad"));
+        assert!(title_matches("Tài liệu - Word", "TÀI"));
+        assert!(!title_matches("Notepad", "chrome"));
+        assert!(!title_matches("Notepad", "  "));
     }
 }

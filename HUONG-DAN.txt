@@ -1,17 +1,20 @@
-Automatic Mouse and Keyboard
-============================
-Giao dien giong RobotSoft AMK — Anh / Viet.
-San pham: crate Rust (khong dung Python).
+Automatic Mouse and Keyboard 0.3.0
+==================================
+Ghi / chạy chuột-phím, Smart Click tìm ảnh, luồng If/For/While/Goto.
+Giao diện Anh / Việt. Windows.
+
+Theo chuẩn RobotSoft AMK cho phần ghi/chạy/lập trình kịch bản.
+Chưa có: compile EXE độc lập, OCR, driver-level, background window, ….
 
 BUILD
 -----
-Can:
+Cần:
   - Rust (https://rustup.rs/)
   - Windows: "Desktop development with C++" (Visual Studio Build Tools)
     https://aka.ms/vs/17/release/vs_BuildTools.exe
 
 Double-click BUILD-RUST.bat
-hoac:
+hoặc:
   cargo build --release
 
 File: target\release\automatic-mouse-keyboard.exe
@@ -19,25 +22,56 @@ File: target\release\automatic-mouse-keyboard.exe
 CHAY
 ----
 Double-click CHAY.bat
-hoac:
+hoặc:
   cargo run --release
   target\release\automatic-mouse-keyboard.exe
 
-Khong UI:
-  automatic-mouse-keyboard.exe --run file.amk
+Không UI:
+  automatic-mouse-keyboard.exe --run file.amk     (thoát mã 1 nếu kịch bản lỗi)
 
-Phim tat / nut
+Lệnh đang chạy
 --------------
-RECORD / GHI     ghi chuot
-SMART CLICK      keo vung BAM, roi anh do.
-                 Khong khop thi KHONG click. Timeout 0 = do 1 lan, khong treo.
-PLAY / CHAY      phat lai  (F9)   tam dung Ctrl+P
-Ctrl+Z           hoan tac
-EN/VI            doi ngon ngu
-Toc do           o khung Play Options
-Nhap doi 1 dong  sua Smart Click / If / cua so / delay...
-Cua so           Activate / Close theo tieu de
-Lich             Tools → Scheduled Tasks (app phai con mo)
-Ghi              co ca lan chuot (wheel)
+GHI (F9)         bắt đầu / dừng ghi chuột, phím, bánh xe, KÉO-THẢ (toàn hệ
+                 thống). Ấn-giữ-vuốt được ghi thành một bước Mouse Drag.
+                 Nhấn đúp/nhấn ba gộp thành 1 bước; nút chuột bên bỏ qua.
+SMART CLICK      kéo vùng / chọn ảnh BMP. Không khớp thì KHÔNG click.
+                 Timeout 0 = dò 1 lần, không treo. Dò trên toàn màn hình ảo
+                 (đủ nhiều màn hình).
+PLAY / CHAY      F10 chạy / tạm dừng
 
-File kich ban: .amk (JSON)  — samples\hello.amk
+F12              dừng chạy hoặc dừng ghi
+Ctrl+P           tạm dừng / tiếp tục
+F7 / F8          Step Into / Step Over (Tools → Debug Run, hoặc F7 khi đang Idle)
+Ctrl+Z           hoàn tác
+EN/VI            đổi ngôn ngữ
+If / Else / For / While / Label / Goto
+                 For tôn trọng step (kể cả step âm)
+Break/Continue   Break thoát vòng lặp đang chạy; Continue bỏ qua phần còn lại
+                 của vòng hiện tại. Dùng ngoài vòng lặp chỉ bị ghi log.
+Key Down/Up      giữ phím / nhả phím — ghép lại thành bấm-giữ bao lâu cũng được.
+Clipboard        Set Clipboard ghi text (có {biến}) vào clipboard;
+                 Get Clipboard đọc clipboard vào một biến.
+Chờ cửa sổ       Wait Window: dừng tới khi tiêu đề cửa sổ xuất hiện
+                 (timeout + on_fail: stop/skip).
+Move duration    Mouse Move có "Thời gian (ms)": 0 = nhảy tức thì,
+                 > 0 = rê chuột mượt tới đích như AMK.
+Biến             Gán biến: giá trị, tên biến, {tên}, hoặc n + 1 (+ - * /).
+                 {tên} trong chữ gõ, phím, lệnh, đường dẫn, tiêu đề cửa sổ.
+                 Chạy kịch bản khác dùng chung biến với kịch bản gọi nó.
+Message Box      hiện hộp thoại Windows. {tên} được thay trước khi hiện.
+Call Function    nhảy tới Function Entry cùng tên, về ở End Function
+Play Script      tải và chạy file .amk khác, dùng chung biến
+Chờ đến giờ      đúng phút đó thì chạy tiếp. Đang trong phút đó thì không chờ.
+                 Phút đã qua thì bỏ qua, không chờ sang ngày hôm sau.
+Số ngẫu nhiên    nằm trong khoảng hai đầu, kể cả hai đầu
+Cửa sổ           Activate / Close / Wait theo một phần tiêu đề
+                 (không phân biệt hoa thường)
+Lịch             Tools → Scheduled Tasks. Chạy đúng HH:MM khi app còn mở
+                 (một lần mỗi ngày cho mỗi tác vụ)
+Nhớ             Ngôn ngữ, phím tắt, tốc độ, cách lặp và lịch được lưu khi thoát
+                 (%APPDATA%\AutomaticMouseKeyboard\session.json)
+Launcher         File → Write launcher (.cmd) — ghi file .cmd cạnh .amk,
+                 gọi --run. Cần .exe trên PATH. Không tạo EXE độc lập.
+Tốc độ           khung Play Options
+
+File kịch bản: .amk (JSON)  — samples\hello.amk

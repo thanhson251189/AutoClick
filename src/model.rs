@@ -42,6 +42,9 @@ pub enum ActionKind {
     MouseMove {
         x: i32,
         y: i32,
+        /// Move duration in ms: 0 = jump instantly, > 0 = glide like AMK.
+        #[serde(default)]
+        ms: u64,
     },
     MouseClick {
         button: MouseBtn,
@@ -64,6 +67,12 @@ pub enum ActionKind {
         interval_ms: u64,
     },
     KeyPress {
+        key: String,
+    },
+    KeyDown {
+        key: String,
+    },
+    KeyUp {
         key: String,
     },
     MouseDown {
@@ -89,6 +98,16 @@ pub enum ActionKind {
         ox: Option<i32>,
         #[serde(default)]
         oy: Option<i32>,
+        /// Search-region size; `x,y` is top-left when set.
+        #[serde(default)]
+        rw: Option<i32>,
+        #[serde(default)]
+        rh: Option<i32>,
+        /// Where the picture was when it was captured. Search starts here.
+        #[serde(default)]
+        px: Option<i32>,
+        #[serde(default)]
+        py: Option<i32>,
     },
     SearchPicture {
         image: String,
@@ -117,6 +136,18 @@ pub enum ActionKind {
     },
     CloseWindow {
         title: String,
+    },
+    WaitWindow {
+        title: String,
+        timeout_ms: u64,
+        #[serde(default = "default_search_fail")]
+        on_fail: String,
+    },
+    SetClipboard {
+        text: String,
+    },
+    GetClipboard {
+        name: String,
     },
     OpenFile {
         path: String,
@@ -147,6 +178,8 @@ pub enum ActionKind {
         expr: String,
     },
     EndWhile,
+    Break,
+    Continue,
     Label {
         name: String,
     },
@@ -165,16 +198,67 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
+    pub fn type_key(&self) -> &'static str {
+        match self {
+            ActionKind::FunctionEntry => "act_function",
+            ActionKind::EndFunction => "act_end",
+            ActionKind::Comment { .. } => "act_comment",
+            ActionKind::Delay { .. } => "act_delay",
+            ActionKind::MouseMove { .. } => "act_mouse_move",
+            ActionKind::MouseClick { .. } => "act_mouse_click",
+            ActionKind::MouseDrag { .. } => "act_mouse_drag",
+            ActionKind::MouseWheel { .. } => "act_mouse_wheel",
+            ActionKind::TypeText { .. } => "act_type",
+            ActionKind::KeyPress { .. } => "act_key",
+            ActionKind::MouseDown { .. } => "act_mouse_down",
+            ActionKind::MouseUp { .. } => "act_mouse_up",
+            ActionKind::KeyDown { .. } => "act_key_down",
+            ActionKind::KeyUp { .. } => "act_key_up",
+            ActionKind::SmartClick { .. } => "act_smart",
+            ActionKind::SearchPicture { .. } => "act_search",
+            ActionKind::WaitTime { .. } => "act_wait_time",
+            ActionKind::RandomNumber { .. } => "act_random",
+            ActionKind::Command { .. } => "act_cmd",
+            ActionKind::ActivateWindow { .. } => "act_activate",
+            ActionKind::CloseWindow { .. } => "act_close",
+            ActionKind::WaitWindow { .. } => "act_wait_win",
+            ActionKind::SetClipboard { .. } => "act_set_clip",
+            ActionKind::GetClipboard { .. } => "act_get_clip",
+            ActionKind::OpenFile { .. } => "act_open_file",
+            ActionKind::OpenUrl { .. } => "act_open_url",
+            ActionKind::OpenFolder { .. } => "act_open_folder",
+            ActionKind::SetVar { .. } => "act_set_var",
+            ActionKind::If { .. } => "act_if",
+            ActionKind::Else => "act_else",
+            ActionKind::EndIf => "act_endif",
+            ActionKind::For { .. } => "act_for",
+            ActionKind::EndFor => "act_endfor",
+            ActionKind::While { .. } => "act_while",
+            ActionKind::EndWhile => "act_endwhile",
+            ActionKind::Break => "act_break",
+            ActionKind::Continue => "act_continue",
+            ActionKind::Label { .. } => "act_label",
+            ActionKind::Goto { .. } => "act_goto",
+            ActionKind::MessageBox { .. } => "act_msg",
+            ActionKind::CallFunction { .. } => "act_call",
+            ActionKind::PlayScript { .. } => "act_play_script",
+        }
+    }
+
     pub fn format_columns(&self) -> (String, String, String) {
         match self {
             ActionKind::FunctionEntry => ("Function".into(), "".into(), "Entry".into()),
             ActionKind::EndFunction => ("End".into(), "Function".into(), "".into()),
             ActionKind::Comment { text } => ("Comment".into(), "".into(), text.clone()),
             ActionKind::Delay { ms } => ("Delay".into(), format!("{} ms", ms), "".into()),
-            ActionKind::MouseMove { x, y } => (
+            ActionKind::MouseMove { x, y, ms } => (
                 "Mouse Move".into(),
                 format!("X: {}, Y: {}", x, y),
-                "".into(),
+                if *ms > 0 {
+                    format!("Duration: {} ms", ms)
+                } else {
+                    "".into()
+                },
             ),
             ActionKind::MouseClick {
                 button,
@@ -206,6 +290,8 @@ impl ActionKind {
                 format!("Interval: {} ms", interval_ms),
             ),
             ActionKind::KeyPress { key } => ("Key Press".into(), key.clone(), "".into()),
+            ActionKind::KeyDown { key } => ("Key Down".into(), key.clone(), "".into()),
+            ActionKind::KeyUp { key } => ("Key Up".into(), key.clone(), "".into()),
             ActionKind::MouseDown { button, x, y } => (
                 "Mouse Down".into(),
                 format!("X: {}, Y: {}", x, y),
@@ -242,6 +328,15 @@ impl ActionKind {
                 ("Activate Window".into(), title.clone(), "".into())
             }
             ActionKind::CloseWindow { title } => ("Close Window".into(), title.clone(), "".into()),
+            ActionKind::WaitWindow {
+                title, timeout_ms, ..
+            } => (
+                "Wait Window".into(),
+                title.clone(),
+                format!("Timeout: {} ms", timeout_ms),
+            ),
+            ActionKind::SetClipboard { text } => ("Set Clipboard".into(), text.clone(), "".into()),
+            ActionKind::GetClipboard { name } => ("Get Clipboard".into(), name.clone(), "".into()),
             ActionKind::OpenFile { path } => ("Open File".into(), path.clone(), "".into()),
             ActionKind::OpenUrl { url } => ("Open URL".into(), url.clone(), "".into()),
             ActionKind::OpenFolder { path } => ("Open Folder".into(), path.clone(), "".into()),
@@ -264,6 +359,8 @@ impl ActionKind {
             ActionKind::EndFor => ("End For".into(), "".into(), "".into()),
             ActionKind::While { expr } => ("While".into(), expr.clone(), "".into()),
             ActionKind::EndWhile => ("End While".into(), "".into(), "".into()),
+            ActionKind::Break => ("Break".into(), "".into(), "".into()),
+            ActionKind::Continue => ("Continue".into(), "".into(), "".into()),
             ActionKind::Label { name } => ("Label".into(), name.clone(), "".into()),
             ActionKind::Goto { name } => ("Goto".into(), name.clone(), "".into()),
             ActionKind::MessageBox { text } => ("Message Box".into(), text.clone(), "".into()),
@@ -287,7 +384,7 @@ impl ActionKind {
                 }
             }
             ActionKind::Delay { ms } => format!("Delay {} ms", ms),
-            ActionKind::MouseMove { x, y } => format!("Mouse Move  ({}, {})", x, y),
+            ActionKind::MouseMove { x, y, .. } => format!("Mouse Move  ({}, {})", x, y),
             ActionKind::MouseClick {
                 button,
                 x,
@@ -331,6 +428,8 @@ impl ActionKind {
                 format!("Type Text  \"{}\"", t)
             }
             ActionKind::KeyPress { key } => format!("Key Press  [{}]", key),
+            ActionKind::KeyDown { key } => format!("Key Down  [{}]", key),
+            ActionKind::KeyUp { key } => format!("Key Up  [{}]", key),
             ActionKind::SmartClick { x, y, image, .. } => {
                 if image.is_empty() {
                     format!("Smart Click  ({}, {})", x, y)
@@ -341,6 +440,9 @@ impl ActionKind {
             ActionKind::SearchPicture { image, .. } => format!("Search Picture  {}", image),
             ActionKind::ActivateWindow { title } => format!("Activate Window  \"{}\"", title),
             ActionKind::CloseWindow { title } => format!("Close Window  \"{}\"", title),
+            ActionKind::WaitWindow { title, .. } => format!("Wait Window  \"{}\"", title),
+            ActionKind::SetClipboard { text } => format!("Set Clipboard  \"{}\"", text),
+            ActionKind::GetClipboard { name } => format!("Get Clipboard  ->  {}", name),
             ActionKind::OpenFile { path } => format!("Open File  {}", path),
             ActionKind::OpenUrl { url } => format!("Open URL  {}", url),
             ActionKind::OpenFolder { path } => format!("Open Folder  {}", path),
@@ -357,6 +459,8 @@ impl ActionKind {
             ActionKind::EndFor => "End For".into(),
             ActionKind::While { expr } => format!("While  ({})", expr),
             ActionKind::EndWhile => "End While".into(),
+            ActionKind::Break => "Break".into(),
+            ActionKind::Continue => "Continue".into(),
             ActionKind::Label { name } => format!("Label  {}", name),
             ActionKind::Goto { name } => format!("Goto  {}", name),
             ActionKind::MessageBox { text } => format!("MessageBox  \"{}\"", text),
@@ -378,6 +482,10 @@ impl ActionKind {
             on_fail: "skip".into(),
             ox: None,
             oy: None,
+            rw: None,
+            rh: None,
+            px: None,
+            py: None,
         }
     }
 
@@ -486,37 +594,26 @@ impl Script {
         serde_json::to_string_pretty(self).map_err(|e| e.to_string())
     }
 
-    pub fn indent_of(&self, index: usize) -> i32 {
-        let mut indent = 0i32;
-        for (i, a) in self.actions.iter().enumerate() {
-            if i == index {
-                if a.kind.is_structure_end() || matches!(a.kind, ActionKind::Else) {
-                    return (indent - 1).max(0);
-                }
-                return indent.max(0);
-            }
-            indent += a.kind.indent_delta();
-            if matches!(a.kind, ActionKind::Else) {
-                // else stays at parent indent visually handled above
-            }
-            indent = indent.max(0);
-        }
-        indent.max(0)
-    }
-
     pub fn optimize_record(&mut self) {
         let mut out: Vec<Action> = Vec::new();
         let mut last_move: Option<(i32, i32)> = None;
         for a in self.actions.drain(..) {
             match a.kind {
-                ActionKind::MouseMove { x, y } => {
+                ActionKind::MouseMove { x, y, .. } => {
                     if let Some((lx, ly)) = last_move {
                         if (x - lx).abs() < 3 && (y - ly).abs() < 3 {
+                            // Keep the dropped move's gap on the previous step.
+                            if let Some(prev) = out.last_mut() {
+                                prev.delay_ms += a.delay_ms;
+                            }
                             continue;
                         }
                         if let Some(prev) = out.last_mut() {
-                            if let ActionKind::MouseMove { .. } = prev.kind {
-                                prev.kind = ActionKind::MouseMove { x, y };
+                            if let ActionKind::MouseMove { ms: pms, .. } = prev.kind {
+                                // Merging two moves keeps the total timeline:
+                                // the second gap must not vanish.
+                                prev.delay_ms += a.delay_ms;
+                                prev.kind = ActionKind::MouseMove { x, y, ms: pms };
                                 prev.name = prev.kind.default_name();
                                 last_move = Some((x, y));
                                 continue;
@@ -529,6 +626,7 @@ impl Script {
                 ActionKind::Delay { ms } => {
                     if let Some(prev) = out.last_mut() {
                         if let ActionKind::Delay { ms: p } = &mut prev.kind {
+                            prev.delay_ms += a.delay_ms;
                             *p += ms;
                             prev.name = prev.kind.default_name();
                             continue;
@@ -547,15 +645,61 @@ impl Script {
     }
 }
 
-#[derive(Clone, Debug)]
+// Field-level defaults: a session.json whose `options` object misses one key
+// must fill in that key, not wipe the whole saved session.
+fn d_play_speed() -> f32 {
+    1.0
+}
+fn d_sample_ms() -> u64 {
+    30
+}
+fn d_ignore_px() -> i32 {
+    2
+}
+fn d_minimize_on_play() -> bool {
+    false
+}
+fn d_hk_record() -> String {
+    "F9".into()
+}
+fn d_hk_play() -> String {
+    "F10".into()
+}
+fn d_hk_stop() -> String {
+    "F12".into()
+}
+fn d_hk_pause() -> String {
+    "Ctrl+P".into()
+}
+fn d_hk_step_into() -> String {
+    "F7".into()
+}
+fn d_hk_step_over() -> String {
+    "F8".into()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AppOptions {
+    #[serde(default = "d_play_speed")]
     pub play_speed: f32,
+    #[serde(default = "d_sample_ms")]
     pub sample_ms: u64,
+    #[serde(default = "d_ignore_px")]
     pub ignore_px: i32,
+    #[serde(default = "d_minimize_on_play")]
     pub minimize_on_play: bool,
+    #[serde(default = "d_hk_record")]
     pub hk_record: String,
+    #[serde(default = "d_hk_play")]
     pub hk_play: String,
+    #[serde(default = "d_hk_stop")]
+    pub hk_stop: String,
+    #[serde(default = "d_hk_pause")]
     pub hk_pause: String,
+    #[serde(default = "d_hk_step_into")]
+    pub hk_step_into: String,
+    #[serde(default = "d_hk_step_over")]
+    pub hk_step_over: String,
 }
 
 impl Default for AppOptions {
@@ -565,18 +709,45 @@ impl Default for AppOptions {
             sample_ms: 30,
             ignore_px: 2,
             minimize_on_play: false,
-            hk_record: "Shift+F2".into(),
-            hk_play: "F9".into(),
+            hk_record: "F9".into(),
+            hk_play: "F10".into(),
+            hk_stop: "F12".into(),
             hk_pause: "Ctrl+P".into(),
+            hk_step_into: "F7".into(),
+            hk_step_over: "F8".into(),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ScheduledTask {
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub script: String,
+    #[serde(default)]
     pub when: String,
+}
+
+/// Parse `HH:MM` (also `H:MM`). None if the string is not a clock time.
+pub fn parse_hhmm(when: &str) -> Option<(u32, u32)> {
+    let when = when.trim();
+    let (h, m) = when.split_once(':')?;
+    let h: u32 = h.trim().parse().ok()?;
+    let m: u32 = m.trim().parse().ok()?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some((h, m))
+}
+
+/// True when `when` matches this clock minute and the task has not already
+/// fired today. Used by the live scheduler tick while the app is open.
+pub fn scheduled_task_due(when: &str, hour: u32, minute: u32, already_fired_today: bool) -> bool {
+    match parse_hhmm(when) {
+        Some((h, m)) => !already_fired_today && h == hour && m == minute,
+        None => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -587,11 +758,142 @@ pub enum RepeatMode {
     Infinite,
 }
 
+impl RepeatMode {
+    pub fn code(self) -> &'static str {
+        match self {
+            RepeatMode::Once => "once",
+            RepeatMode::Times => "times",
+            RepeatMode::Duration => "duration",
+            RepeatMode::Infinite => "infinite",
+        }
+    }
+
+    pub fn from_code(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "times" => RepeatMode::Times,
+            "duration" => RepeatMode::Duration,
+            "infinite" => RepeatMode::Infinite,
+            _ => RepeatMode::Once,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DurationUnit {
     Seconds,
     Minutes,
     Hours,
+}
+
+impl DurationUnit {
+    pub fn code(self) -> &'static str {
+        match self {
+            DurationUnit::Seconds => "seconds",
+            DurationUnit::Minutes => "minutes",
+            DurationUnit::Hours => "hours",
+        }
+    }
+
+    pub fn from_code(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "seconds" => DurationUnit::Seconds,
+            "hours" => DurationUnit::Hours,
+            _ => DurationUnit::Minutes,
+        }
+    }
+}
+
+fn default_session_lang() -> String {
+    "vi".into()
+}
+fn default_session_repeat() -> String {
+    "once".into()
+}
+fn default_session_repeat_n() -> u32 {
+    10
+}
+fn default_session_duration_n() -> u32 {
+    1
+}
+fn default_session_duration_unit() -> String {
+    "minutes".into()
+}
+fn default_session_speed_enabled() -> bool {
+    true
+}
+
+/// Language, hotkeys, repeat, and scheduled tasks. Restored on the next launch.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AppSession {
+    #[serde(default = "default_session_lang")]
+    pub lang: String,
+    #[serde(default)]
+    pub options: AppOptions,
+    #[serde(default)]
+    pub tasks: Vec<ScheduledTask>,
+    #[serde(default = "default_session_repeat")]
+    pub repeat: String,
+    #[serde(default = "default_session_repeat_n")]
+    pub repeat_n: u32,
+    #[serde(default = "default_session_duration_n")]
+    pub duration_n: u32,
+    #[serde(default = "default_session_duration_unit")]
+    pub duration_unit: String,
+    #[serde(default = "default_session_speed_enabled")]
+    pub speed_enabled: bool,
+}
+
+impl Default for AppSession {
+    fn default() -> Self {
+        Self {
+            lang: default_session_lang(),
+            options: AppOptions::default(),
+            tasks: Vec::new(),
+            repeat: default_session_repeat(),
+            repeat_n: default_session_repeat_n(),
+            duration_n: default_session_duration_n(),
+            duration_unit: default_session_duration_unit(),
+            speed_enabled: default_session_speed_enabled(),
+        }
+    }
+}
+
+impl AppSession {
+    pub fn repeat_mode(&self) -> RepeatMode {
+        RepeatMode::from_code(&self.repeat)
+    }
+
+    pub fn duration_unit(&self) -> DurationUnit {
+        DurationUnit::from_code(&self.duration_unit)
+    }
+
+    pub fn load(path: &std::path::Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&text).unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> bool {
+        let Ok(text) = serde_json::to_string_pretty(self) else {
+            return false;
+        };
+        if let Some(dir) = path.parent() {
+            if !dir.as_os_str().is_empty() && std::fs::create_dir_all(dir).is_err() {
+                return false;
+            }
+        }
+        std::fs::write(path, text).is_ok()
+    }
+}
+
+pub fn session_path() -> std::path::PathBuf {
+    if let Some(base) = std::env::var_os("APPDATA") {
+        return std::path::PathBuf::from(base)
+            .join("AutomaticMouseKeyboard")
+            .join("session.json");
+    }
+    std::path::PathBuf::from("amk-session.json")
 }
 
 fn btn_from(s: &str) -> MouseBtn {
@@ -605,7 +907,8 @@ fn btn_from(s: &str) -> MouseBtn {
 fn i32_of(v: &Value, key: &str, default: i32) -> i32 {
     v.get(key)
         .and_then(|x| x.as_i64().or_else(|| x.as_f64().map(|f| f as i64)))
-        .unwrap_or(default as i64) as i32
+        .unwrap_or(default as i64)
+        .clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
 fn u64_of(v: &Value, key: &str, default: u64) -> u64 {
@@ -620,6 +923,8 @@ fn str_of(v: &Value, key: &str) -> String {
             x.as_str()
                 .map(|s| s.to_string())
                 .or_else(|| x.as_i64().map(|i| i.to_string()))
+                .or_else(|| x.as_f64().map(|f| f.to_string()))
+                .or_else(|| x.as_bool().map(|b| b.to_string()))
         })
         .unwrap_or_default()
 }
@@ -637,12 +942,13 @@ fn kind_from_python(kind: &str, p: &Value) -> ActionKind {
         "move" | "mousemove" => ActionKind::MouseMove {
             x: i32_of(p, "x", 0),
             y: i32_of(p, "y", 0),
+            ms: u64_of(p, "ms", 0),
         },
         "click" | "mouseclick" => ActionKind::MouseClick {
             button: btn_from(&str_of(p, "button")),
             x: i32_of(p, "x", 0),
             y: i32_of(p, "y", 0),
-            clicks: i32_of(p, "clicks", 1).max(1) as u8,
+            clicks: i32_of(p, "clicks", 1).clamp(1, 255) as u8,
         },
         "down" | "mousedown" => ActionKind::MouseDown {
             button: btn_from(&str_of(p, "button")),
@@ -664,6 +970,41 @@ fn kind_from_python(kind: &str, p: &Value) -> ActionKind {
         "key" | "keypress" => ActionKind::KeyPress {
             key: str_of(p, "key"),
         },
+        "keydown" => ActionKind::KeyDown {
+            key: str_of(p, "key"),
+        },
+        "keyup" => ActionKind::KeyUp {
+            key: str_of(p, "key"),
+        },
+        "break" => ActionKind::Break,
+        "continue" => ActionKind::Continue,
+        "setclip" | "setclipboard" => ActionKind::SetClipboard {
+            text: str_of(p, "text"),
+        },
+        "getclip" | "getclipboard" => ActionKind::GetClipboard {
+            name: {
+                let n = str_of(p, "name");
+                if n.is_empty() {
+                    "clip".into()
+                } else {
+                    n
+                }
+            },
+        },
+        "waitwindow" => {
+            let mut k = ActionKind::WaitWindow {
+                title: str_of(p, "title"),
+                timeout_ms: u64_of(p, "timeout", u64_of(p, "timeout_ms", 5000)),
+                on_fail: "stop".into(),
+            };
+            if let ActionKind::WaitWindow { on_fail, .. } = &mut k {
+                let f = str_of(p, "on_fail");
+                if !f.is_empty() {
+                    *on_fail = f;
+                }
+            }
+            k
+        }
         "smart" | "smartclick" => {
             let tgt = p
                 .get("targets")
@@ -869,8 +1210,22 @@ fn load_flexible_amk(s: &str) -> Result<Script, String> {
     } else {
         return Err("no actions".into());
     };
-    let actions: Vec<Action> = list.iter().filter_map(action_from_value).collect();
-    if actions.is_empty() {
+    // Unparsable entries become visible comments instead of vanishing, but a
+    // file with no real action at all stays an error.
+    let mut actions: Vec<Action> = Vec::new();
+    let mut parsed = 0usize;
+    for (idx, v) in list.iter().enumerate() {
+        match action_from_value(v) {
+            Some(a) => {
+                parsed += 1;
+                actions.push(a);
+            }
+            None => actions.push(Action::new(ActionKind::Comment {
+                text: format!("unparsable action #{}", idx + 1),
+            })),
+        }
+    }
+    if parsed == 0 {
         return Err("no valid actions".into());
     }
     Ok(Script {
@@ -950,5 +1305,172 @@ mod tests {
             }
             other => panic!("{:?}", other),
         }
+    }
+
+    #[test]
+    fn scheduled_task_due_matches_clock_once_per_day() {
+        assert!(scheduled_task_due("09:00", 9, 0, false));
+        assert!(scheduled_task_due("9:00", 9, 0, false));
+        assert!(!scheduled_task_due("09:00", 9, 0, true));
+        assert!(!scheduled_task_due("09:00", 9, 1, false));
+        assert!(!scheduled_task_due("not-a-time", 9, 0, false));
+        assert!(!scheduled_task_due("24:00", 0, 0, false));
+    }
+
+    #[test]
+    fn session_roundtrip_keeps_hotkeys_tasks_and_repeat() {
+        let path = std::env::temp_dir().join(format!("amk_session_{}.json", std::process::id()));
+        let options = AppOptions {
+            hk_record: "Ctrl+F9".into(),
+            ..AppOptions::default()
+        };
+        let session = AppSession {
+            lang: "en".into(),
+            options,
+            repeat: "times".into(),
+            repeat_n: 4,
+            tasks: vec![ScheduledTask {
+                name: "Morning".into(),
+                script: "a.amk".into(),
+                when: "09:30".into(),
+            }],
+            ..AppSession::default()
+        };
+        assert!(session.save(&path));
+        let back = AppSession::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(back, session);
+        assert_eq!(back.repeat_mode(), RepeatMode::Times);
+        assert_eq!(back.options.hk_record, "Ctrl+F9");
+    }
+
+    #[test]
+    fn broken_session_file_falls_back_to_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("amk_session_bad_{}.json", std::process::id()));
+        std::fs::write(&path, "{not json").unwrap();
+        let session = AppSession::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(session, AppSession::default());
+        assert_eq!(session.options.hk_record, "F9");
+        assert_eq!(session.repeat_mode(), RepeatMode::Once);
+    }
+
+    #[test]
+    fn partial_session_fills_the_rest_from_defaults() {
+        let path =
+            std::env::temp_dir().join(format!("amk_session_part_{}.json", std::process::id()));
+        std::fs::write(&path, r#"{"lang":"en"}"#).unwrap();
+        let session = AppSession::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(session.lang, "en");
+        assert_eq!(session.repeat, "once");
+        assert_eq!(session.repeat_n, 10);
+        assert!(session.speed_enabled);
+        assert_eq!(session.options.hk_play, "F10");
+    }
+
+    #[test]
+    fn partial_options_object_keeps_the_session_instead_of_wiping_it() {
+        let path =
+            std::env::temp_dir().join(format!("amk_session_popt_{}.json", std::process::id()));
+        // `options` present but incomplete: the rest must fill from defaults
+        // and the tasks/lang around it must survive.
+        std::fs::write(
+            &path,
+            r#"{"lang":"en","options":{"play_speed":2.5},"tasks":[{"name":"T","script":"a.amk"}]}"#,
+        )
+        .unwrap();
+        let session = AppSession::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(session.lang, "en");
+        assert!((session.options.play_speed - 2.5).abs() < f32::EPSILON);
+        assert_eq!(session.options.hk_play, "F10");
+        assert_eq!(session.tasks.len(), 1);
+        assert_eq!(session.tasks[0].script, "a.amk");
+    }
+
+    #[test]
+    fn optimize_record_keeps_merged_gaps_on_the_timeline() {
+        let mut sc = Script::default();
+        let mk = |kind: ActionKind, delay: u64| Action::new(kind).with_delay(delay);
+        sc.actions = vec![
+            mk(
+                ActionKind::MouseMove {
+                    x: 10,
+                    y: 10,
+                    ms: 0,
+                },
+                30,
+            ),
+            mk(
+                ActionKind::MouseMove {
+                    x: 50,
+                    y: 50,
+                    ms: 0,
+                },
+                30,
+            ),
+            mk(
+                ActionKind::MouseMove {
+                    x: 51,
+                    y: 51,
+                    ms: 0,
+                },
+                30,
+            ),
+            mk(ActionKind::Delay { ms: 200 }, 30),
+            mk(ActionKind::Delay { ms: 300 }, 30),
+        ];
+        sc.optimize_record();
+        // Two moves merge into one carrying both gaps; the tiny third move's
+        // 30 ms rides on it; the two delays merge carrying both 30 ms gaps.
+        assert_eq!(sc.actions.len(), 2, "{:?}", sc.actions);
+        assert_eq!(sc.actions[0].delay_ms, 60 + 30);
+        assert!(matches!(
+            sc.actions[0].kind,
+            ActionKind::MouseMove {
+                x: 50,
+                y: 50,
+                ms: _
+            }
+        ));
+        assert_eq!(sc.actions[1].delay_ms, 30 + 30);
+        assert!(matches!(sc.actions[1].kind, ActionKind::Delay { ms: 500 }));
+    }
+
+    #[test]
+    fn python_params_survive_extreme_and_typed_values() {
+        let big = serde_json::json!({"x": 5_000_000_000i64, "y": 0, "clicks": 300});
+        assert_eq!(i32_of(&big, "x", 0), i32::MAX);
+        let clicks = match kind_from_python("click", &big) {
+            ActionKind::MouseClick { clicks, .. } => clicks,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(clicks, 255, "clicks must clamp, not truncate 300 to 44");
+
+        let typed = serde_json::json!({"text": true, "value": 1.5});
+        assert_eq!(str_of(&typed, "text"), "true");
+        assert_eq!(str_of(&typed, "value"), "1.5");
+    }
+
+    #[test]
+    fn flexible_loader_marks_unparsable_actions_and_still_rejects_garbage() {
+        let s = r#"{
+          "version":"1.0","name":"mixed",
+          "actions":[
+            {"kind":"delay","name":"","enabled":true,"delay_ms":0,"params":{"ms":100}},
+            {"name":"no kind here","enabled":true,"delay_ms":0},
+            {"kind":123,"enabled":true,"delay_ms":0}
+          ]
+        }"#;
+        let sc = Script::load_json(s).expect("one valid action keeps the script");
+        assert_eq!(sc.actions.len(), 3);
+        assert!(matches!(sc.actions[0].kind, ActionKind::Delay { ms: 100 }));
+        assert!(matches!(sc.actions[1].kind, ActionKind::Comment { .. }));
+        assert!(matches!(sc.actions[2].kind, ActionKind::Comment { .. }));
+
+        let garbage = r#"{"actions":[1,2,3]}"#;
+        assert!(Script::load_json(garbage).is_err());
     }
 }

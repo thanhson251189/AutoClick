@@ -1,12 +1,14 @@
 mod app;
 mod capture;
+mod clipboard;
 mod engine;
 mod eval;
+mod hotkeys;
 mod i18n;
+mod icons;
 mod model;
 mod record;
 mod vision;
-mod icons;
 
 use eframe::egui;
 
@@ -21,12 +23,23 @@ fn main() -> eframe::Result<()> {
                         .parent()
                         .map(|p| p.to_path_buf());
                     let engine = engine::Engine::new();
-                    engine.play(script, 2.5, 1, None, dir);
+                    engine.play(script, 2.5, 1, None, dir, false);
+                    // Stream new log lines as they appear so a hung or slow
+                    // script is visible instead of silent until the end.
+                    let mut printed = 0usize;
                     while engine.snapshot_state() != engine::RunState::Idle {
+                        let logs = engine.logs();
+                        while printed < logs.len() {
+                            println!("{}  {}", logs[printed].time, logs[printed].text);
+                            printed += 1;
+                        }
                         std::thread::sleep(std::time::Duration::from_millis(40));
                     }
-                    for line in engine.logs() {
+                    for line in engine.logs().iter().skip(printed) {
                         println!("{}  {}", line.time, line.text);
+                    }
+                    if !engine.last_run_ok() {
+                        std::process::exit(1);
                     }
                     return Ok(());
                 }
@@ -44,7 +57,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 640.0])
-            .with_min_inner_size([780.0, 480.0])
+            .with_min_inner_size([720.0, 480.0])
             .with_title("Automatic Mouse and Keyboard"),
         ..Default::default()
     };
@@ -112,45 +125,45 @@ fn install_fonts(ctx: &egui::Context) {
 fn apply_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::light();
-    style.visuals.window_fill = egui::Color32::from_rgb(240, 240, 240);
-    style.visuals.panel_fill = egui::Color32::from_rgb(240, 240, 240);
-    style.visuals.faint_bg_color = egui::Color32::from_rgb(250, 250, 250);
+    let line = egui::Color32::from_rgb(226, 230, 235);
+    let ink = egui::Color32::from_rgb(28, 36, 48);
+    style.visuals.window_fill = egui::Color32::from_rgb(244, 246, 248);
+    style.visuals.panel_fill = egui::Color32::WHITE;
+    style.visuals.faint_bg_color = egui::Color32::from_rgb(247, 248, 250);
+    style.visuals.extreme_bg_color = egui::Color32::WHITE;
+    style.visuals.window_rounding = egui::Rounding::same(8.0);
+    style.visuals.menu_rounding = egui::Rounding::same(6.0);
 
-    // Widget states: ensure radio/checkbox decorations are VISIBLE.
-    // inactive = normal, un-hovered widget
     style.visuals.widgets.inactive.bg_fill = egui::Color32::WHITE;
-    style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(248, 248, 248);
-    style.visuals.widgets.inactive.bg_stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 180, 180));
-    style.visuals.widgets.inactive.fg_stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 60, 60));
-    style.visuals.widgets.inactive.rounding = egui::Rounding::same(3.0);
+    style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(247, 248, 250);
+    style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, line);
+    style.visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, ink);
+    style.visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
 
-    // hovered widget
-    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(229, 241, 251);
-    style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(229, 241, 251);
+    style.visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(232, 241, 251);
+    style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(243, 246, 249);
     style.visuals.widgets.hovered.bg_stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(100, 160, 220));
-    style.visuals.widgets.hovered.fg_stroke =
-        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(30, 30, 30));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(47, 111, 237));
+    style.visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, ink);
+    style.visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
 
-    // active (pressed) widget
-    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(200, 225, 245);
+    style.visuals.widgets.active.bg_fill = egui::Color32::from_rgb(214, 228, 246);
     style.visuals.widgets.active.bg_stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(60, 120, 200));
-    style.visuals.widgets.active.fg_stroke =
-        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 0, 0));
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(47, 111, 237));
+    style.visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, ink);
+    style.visuals.widgets.active.rounding = egui::Rounding::same(6.0);
 
-    // open (combo box opened, etc.)
-    style.visuals.widgets.open.bg_fill = egui::Color32::from_rgb(220, 235, 250);
+    style.visuals.widgets.open.bg_fill = egui::Color32::WHITE;
+    style.visuals.widgets.open.rounding = egui::Rounding::same(6.0);
+    style.visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, ink);
+    style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, line);
 
-    // noninteractive (labels, separators)
-    style.visuals.widgets.noninteractive.bg_stroke =
-        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(220, 220, 220));
-
-    style.visuals.selection.bg_fill = egui::Color32::from_rgb(51, 153, 255);
-    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-    style.spacing.button_padding = egui::vec2(8.0, 4.0);
+    style.visuals.selection.bg_fill = egui::Color32::from_rgb(232, 241, 251);
+    style.visuals.selection.stroke =
+        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(18, 48, 85));
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(10.0, 6.0);
+    style.spacing.menu_margin = egui::Margin::same(6.0);
     ctx.set_style(style);
 }
 
