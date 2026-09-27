@@ -5,20 +5,6 @@ pub enum Lang {
 }
 
 impl Lang {
-    pub fn toggle(self) -> Self {
-        match self {
-            Lang::En => Lang::Vi,
-            Lang::Vi => Lang::En,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Lang::En => "EN",
-            Lang::Vi => "VI",
-        }
-    }
-
     pub fn code(self) -> &'static str {
         match self {
             Lang::En => "en",
@@ -269,6 +255,44 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Vi, "json_query") => "Đường dẫn (a.b.0.c)",
         (Lang::En, "json_hint") => "The value at the path is stored as text in the variable.",
         (Lang::Vi, "json_hint") => "Giá trị tại đường dẫn được lưu dạng chữ vào biến.",
+        (Lang::En, "json_read") => "Read",
+        (Lang::Vi, "json_read") => "Đọc",
+        (Lang::En, "json_write") => "Write",
+        (Lang::Vi, "json_write") => "Ghi",
+        (Lang::En, "json_value") => "Value",
+        (Lang::Vi, "json_value") => "Giá trị",
+        (Lang::En, "json_write_hint") => "The value is written to the file at the dot path; a missing file is created.",
+        (Lang::Vi, "json_write_hint") => "Ghi giá trị vào tệp theo đường dẫn; tệp chưa có sẽ được tạo mới.",
+
+        (Lang::En, "insert_registry") => "Registry…",
+        (Lang::Vi, "insert_registry") => "Registry…",
+        (Lang::En, "dlg_registry") => "Registry",
+        (Lang::Vi, "dlg_registry") => "Registry",
+        (Lang::En, "reg_read") => "Read",
+        (Lang::Vi, "reg_read") => "Đọc",
+        (Lang::En, "reg_write") => "Write",
+        (Lang::Vi, "reg_write") => "Ghi",
+        (Lang::En, "reg_path") => "Path (HKCU\\...)",
+        (Lang::Vi, "reg_path") => "Đường dẫn (HKCU\\...)",
+        (Lang::En, "reg_value") => "Value name",
+        (Lang::Vi, "reg_value") => "Tên giá trị",
+        (Lang::En, "reg_data") => "Data",
+        (Lang::Vi, "reg_data") => "Dữ liệu",
+        (Lang::En, "reg_hint") => "String values only. HKCU and HKLM roots; {vars} are expanded.",
+        (Lang::Vi, "reg_hint") => "Chỉ giá trị kiểu chữ. Gốc HKCU và HKLM; {biến} được thay trước.",
+
+        (Lang::En, "menu_rename_var") => "Rename Variable…",
+        (Lang::Vi, "menu_rename_var") => "Đổi tên biến…",
+        (Lang::En, "rename_from") => "Current name",
+        (Lang::Vi, "rename_from") => "Tên hiện tại",
+        (Lang::En, "rename_to") => "New name",
+        (Lang::Vi, "rename_to") => "Tên mới",
+        (Lang::En, "rename_apply") => "Rename",
+        (Lang::Vi, "rename_apply") => "Đổi tên",
+        (Lang::En, "rename_hint") => "Renames assignments, {name} references, and whole words inside If/While/Switch expressions.",
+        (Lang::Vi, "rename_hint") => "Đổi tên chỗ gán, chỗ dùng {tên}, và cả từ nguyên vẹn trong biểu thức If/While/Switch.",
+        (Lang::En, "rename_done") => "Renamed fields",
+        (Lang::Vi, "rename_done") => "Số chỗ đã đổi",
         (Lang::En, "file_random") => "Random Script",
         (Lang::Vi, "file_random") => "Kịch bản ngẫu nhiên",
         (Lang::En, "insert_play_random") => "Play Random Script…",
@@ -401,10 +425,24 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::Vi, "win_close") => "Đóng cửa sổ",
         (Lang::En, "win_wait") => "Wait for Window",
         (Lang::Vi, "win_wait") => "Chờ cửa sổ",
+        (Lang::En, "win_min") => "Minimize Window",
+        (Lang::Vi, "win_min") => "Thu nhỏ cửa sổ",
+        (Lang::En, "win_max") => "Maximize Window",
+        (Lang::Vi, "win_max") => "Phóng to cửa sổ",
+        (Lang::En, "win_restore") => "Restore Window",
+        (Lang::Vi, "win_restore") => "Khôi phục cửa sổ",
         (Lang::En, "clip_set") => "Set Clipboard",
         (Lang::Vi, "clip_set") => "Gán Clipboard",
         (Lang::En, "clip_get") => "Get Clipboard",
         (Lang::Vi, "clip_get") => "Đọc Clipboard",
+        (Lang::En, "clip_set_html") => "Set HTML",
+        (Lang::Vi, "clip_set_html") => "Ghi HTML",
+        (Lang::En, "clip_get_html") => "Get HTML",
+        (Lang::Vi, "clip_get_html") => "Đọc HTML",
+        (Lang::En, "clip_html") => "HTML to put on the clipboard",
+        (Lang::Vi, "clip_html") => "HTML sẽ ghi vào clipboard",
+        (Lang::En, "clip_html_hint") => "Pastes as rich text (Windows \"HTML Format\").",
+        (Lang::Vi, "clip_html_hint") => "Dán ra thành văn bản định dạng (Windows \"HTML Format\").",
         (Lang::En, "clip_text") => "Text to put on the clipboard",
         (Lang::Vi, "clip_text") => "Nội dung sẽ ghi vào clipboard",
         (Lang::En, "clip_var") => "Variable to store the clipboard text",
@@ -425,8 +463,8 @@ pub fn t(lang: Lang, key: &str) -> &'static str {
         (Lang::En, "about_body") => "Automatic Mouse and Keyboard records mouse/keyboard, plays scripts, and finds on-screen pictures (Smart Click / Search Picture).\n\nAlso working: If/Else, For/While, Label/Goto, variables, Message Box, Call Function, Play Script, scheduled tasks while this window is open, headless --run, and a .cmd launcher (not a packed EXE).\n\nIndependent Rust app with English / Vietnamese UI. Inspired by RobotSoft AMK — not feature-complete with AMK 6.x.\nVersion 0.3.0",
         (Lang::Vi, "about_body") => "Automatic Mouse and Keyboard ghi chuột/phím, chạy kịch bản, và tìm ảnh trên màn hình (Smart Click / Tìm hình).\n\nĐang chạy: If/Else, For/While, Label/Goto, biến, Message Box, Gọi hàm, Chạy kịch bản, lịch khi cửa sổ còn mở, --run không UI, launcher .cmd (không phải EXE đóng gói).\n\nỨng dụng Rust độc lập, giao diện Anh / Việt. Lấy cảm hứng từ RobotSoft AMK — không đủ feature AMK 6.x.\nPhiên bản 0.3.0",
 
-        (Lang::En, "help_body") => "How to use\n\n1. RECORD — press RECORD or F9. Press F9 again to stop. Mouse, keys, and the wheel appear in the list.\n2. SMART CLICK — pick X/Y or an image file; playback finds the picture and clicks it. No match → no click.\n3. PLAY — runs the script. Repeat once, N times, or for a duration. Ctrl+P pauses.\n4. Insert commands from the left toolbox or the Insert menu.\n5. Double-click a row to edit. Use Optimize Record to shrink a raw recording.\n6. Save as .amk (JSON). Headless: automatic-mouse-keyboard --run file.amk\n\nWorking commands: mouse/keyboard (incl. Key Down/Up and drags), delay, Smart Click / Search Picture, window (activate/close/wait), clipboard set/get, file, If/Else, For/While with Break/Continue, Label/Goto, variables, Message Box, Call Function, Play Script, scheduled tasks while the app is open, write .cmd launcher.\n\nHotkeys (global on Windows)\n  F9         Start / Stop recording\n  F10        Start / Pause playback\n  F12        Stop play or record\n  Ctrl+P     Pause / Resume\n  F7         Step Into (debug)\n  F8         Step Over (debug)\n\nVariables\n  Set Variable takes a value, a variable name, {name}, or math: n + 1  (+ - * /).\n  {name} also works in typed text, keys, commands, paths, and window titles.\n  Play Script shares variables with the caller.\n\nLanguage, hotkeys, repeat, and scheduled tasks are remembered after you close the window. Tasks still run only while this window is open.\n\nTips\n  Give every step a name. Use Search Picture when the target moves. Disable unused steps instead of deleting them.",
-        (Lang::Vi, "help_body") => "Cách dùng\n\n1. GHI — bấm GHI hoặc F9. Bấm F9 lần nữa để dừng. Chuột, phím và bánh xe hiện trong danh sách.\n2. SMART CLICK — chọn tọa độ X/Y hoặc tệp ảnh; khi chạy, chương trình tìm ảnh và click. Không khớp → không click.\n3. CHẠY — thực thi kịch bản. Lặp 1 lần, N lần, hoặc theo thời gian. Ctrl+P tạm dừng.\n4. Chèn lệnh từ hộp công cụ trái hoặc menu Chèn.\n5. Nhấp đúp một dòng để sửa. Dùng Tối ưu bản ghi để rút gọn bản ghi thô.\n6. Lưu file .amk (JSON). Không UI: automatic-mouse-keyboard --run file.amk\n\nLệnh đang chạy: chuột/phím (gồm Key Down/Up và kéo-thả), delay, Smart Click / Tìm hình, cửa sổ (kích hoạt/đóng/chờ), clipboard, tệp, If/Else, For/While với Break/Continue, Label/Goto, biến, Message Box, Gọi hàm, Chạy kịch bản, lịch (app đang mở), ghi launcher .cmd.\n\nPhím tắt (toàn hệ thống trên Windows)\n  F9         Bắt đầu / Dừng ghi\n  F10        Chạy / Tạm dừng\n  F12        Dừng chạy hoặc ghi\n  Ctrl+P     Tạm dừng / Tiếp tục\n  F7         Step Into (debug)\n  F8         Step Over (debug)\n\nBiến\n  Gán biến nhận giá trị, tên biến, {tên}, hoặc phép tính n + 1  (+ - * /).\n  {tên} dùng được trong chữ gõ, phím, lệnh, đường dẫn và tiêu đề cửa sổ.\n  Chạy kịch bản dùng chung biến với kịch bản gọi nó.\n\nNgôn ngữ, phím tắt, cách lặp và lịch được nhớ sau khi đóng cửa sổ. Lịch vẫn chỉ chạy khi cửa sổ này đang mở.\n\nMẹo\n  Đặt tên từng bước. Dùng Tìm hình khi đối tượng bị lệch vị trí. Tắt bước không dùng thay vì xóa.",
+        (Lang::En, "help_body") => "How to use\n\n1. RECORD — press RECORD or F9. Press F9 again to stop. Mouse, keys, and the wheel appear in the list.\n2. SMART CLICK — pick X/Y or an image file; playback finds the picture and clicks it. No match → no click.\n3. PLAY — runs the script. Repeat once, N times, or for a duration. Ctrl+P pauses.\n4. Insert commands from the left toolbox or the Insert menu.\n5. Double-click a row to edit. Use Optimize Record to shrink a raw recording.\n6. Save as .amk (JSON). Headless: automatic-mouse-keyboard --run file.amk\n\nWorking commands: mouse/keyboard (incl. Key Down/Up and drags), delay, Smart Click / Search Picture, window (activate/close/wait/minimize/maximize/restore), clipboard set/get (text and HTML), Read/Write JSON, Read/Write Registry, file, If/Else, For/While with Break/Continue, Switch/Case, Label/Goto, variables, Message Box, Call Function, Play Script, Play Random, scheduled tasks while the app is open, write .cmd launcher, Tools > Rename Variable.\n\nHotkeys (global on Windows)\n  F9         Start / Stop recording\n  F10        Start / Pause playback\n  F12        Stop play or record\n  Ctrl+P     Pause / Resume\n  F7         Step Into (debug)\n  F8         Step Over (debug)\n\nVariables\n  Set Variable takes a value, a variable name, {name}, or math: n + 1  (+ - * /).\n  Functions (case-insensitive) work in values and conditions:\n  LEN UPPER LOWER TRIM MID LEFT RIGHT REPLACE INSTR VAL STR ASC CHR\n  ABS SQRT CEIL FLOOR ROUND POW MOD MIN MAX RAND NOW TODAY YEAR MONTH\n  DAY HOUR MINUTE SECOND WEEKDAY TICKS FILE_EXISTS FILE_SIZE FILE_READ\n  FILE_WRITE ENV CLIP\n  {name} also works in typed text, keys, commands, paths, and window titles.\n  Play Script shares variables with the caller.\n\nLanguage, hotkeys, repeat, and scheduled tasks are remembered after you close the window. Tasks still run only while this window is open.\n\nTips\n  Give every step a name. Use Search Picture when the target moves. Disable unused steps instead of deleting them.",
+        (Lang::Vi, "help_body") => "Cách dùng\n\n1. GHI — bấm GHI hoặc F9. Bấm F9 lần nữa để dừng. Chuột, phím và bánh xe hiện trong danh sách.\n2. SMART CLICK — chọn tọa độ X/Y hoặc tệp ảnh; khi chạy, chương trình tìm ảnh và click. Không khớp → không click.\n3. CHẠY — thực thi kịch bản. Lặp 1 lần, N lần, hoặc theo thời gian. Ctrl+P tạm dừng.\n4. Chèn lệnh từ hộp công cụ trái hoặc menu Chèn.\n5. Nhấp đúp một dòng để sửa. Dùng Tối ưu bản ghi để rút gọn bản ghi thô.\n6. Lưu file .amk (JSON). Không UI: automatic-mouse-keyboard --run file.amk\n\nLệnh đang chạy: chuột/phím (gồm Key Down/Up và kéo-thả), delay, Smart Click / Tìm hình, cửa sổ (kích hoạt/đóng/chờ/thu nhỏ/phóng to/khôi phục), clipboard chữ và HTML, Đọc/Ghi JSON, Đọc/Ghi Registry, tệp, If/Else, For/While với Break/Continue, Switch/Case, Label/Goto, biến, Message Box, Gọi hàm, Chạy kịch bản, Chạy ngẫu nhiên, lịch (app đang mở), ghi launcher .cmd, Công cụ > Đổi tên biến.\n\nPhím tắt (toàn hệ thống trên Windows)\n  F9         Bắt đầu / Dừng ghi\n  F10        Chạy / Tạm dừng\n  F12        Dừng chạy hoặc ghi\n  Ctrl+P     Tạm dừng / Tiếp tục\n  F7         Step Into (debug)\n  F8         Step Over (debug)\n\nBiến\n  Gán biến nhận giá trị, tên biến, {tên}, hoặc phép tính n + 1  (+ - * /).\n  Hàm (không phân biệt hoa thường) dùng được trong giá trị và điều kiện:\n  LEN UPPER LOWER TRIM MID LEFT RIGHT REPLACE INSTR VAL STR ASC CHR\n  ABS SQRT CEIL FLOOR ROUND POW MOD MIN MAX RAND NOW TODAY YEAR MONTH\n  DAY HOUR MINUTE SECOND WEEKDAY TICKS FILE_EXISTS FILE_SIZE FILE_READ\n  FILE_WRITE ENV CLIP\n  {tên} dùng được trong chữ gõ, phím, lệnh, đường dẫn và tiêu đề cửa sổ.\n  Chạy kịch bản dùng chung biến với kịch bản gọi nó.\n\nNgôn ngữ, phím tắt, cách lặp và lịch được nhớ sau khi đóng cửa sổ. Lịch vẫn chỉ chạy khi cửa sổ này đang mở.\n\nMẹo\n  Đặt tên từng bước. Dùng Tìm hình khi đối tượng bị lệch vị trí. Tắt bước không dùng thay vì xóa.",
 
         (Lang::En, "status_ready") => "Ready. Click RECORD to capture mouse and keyboard, or insert actions from the toolbox.",
         (Lang::Vi, "status_ready") => "Sẵn sàng. Bấm GHI để ghi chuột/bàn phím, hoặc chèn hành động từ hộp công cụ.",

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use chrono::{Datelike, Timelike};
+
 fn split_ci<'a>(e: &'a str, sep: &str) -> Option<(&'a str, &'a str)> {
     let el = e.to_ascii_lowercase();
     let sl = sep.to_ascii_lowercase();
@@ -109,6 +111,9 @@ fn atom(expr: &str, vars: &HashMap<String, String>) -> Option<f64> {
     if let Some(inner) = strip_parens(expr) {
         return arith(inner, vars);
     }
+    if let Some(v) = try_call(expr, vars) {
+        return v.trim().parse().ok();
+    }
     let text = vars.get(expr).map(String::as_str).unwrap_or(expr);
     text.parse().ok()
 }
@@ -155,10 +160,14 @@ fn format_num(n: f64) -> String {
     }
 }
 
-/// Variable copy, `{name}` expansion, or `+ - * /` (parentheses and `*`/`/` bind tighter).
+/// Variable copy, `{name}` expansion, `+ - * /`, or `FUNC(args)` calls.
 /// A value that is only a variable name is copied as stored, so `hello-world` stays text.
 pub fn eval_value(expr: &str, vars: &HashMap<String, String>) -> String {
-    let expanded = expand_text(expr.trim(), vars);
+    let trimmed = expr.trim();
+    if let Some(result) = try_call(trimmed, vars) {
+        return result;
+    }
+    let expanded = expand_text(trimmed, vars);
     let expanded = expanded.trim();
     if let Some(v) = vars.get(expanded) {
         return v.clone();
@@ -172,7 +181,11 @@ pub fn eval_value(expr: &str, vars: &HashMap<String, String>) -> String {
 }
 
 pub fn eval_truth(expr: &str, vars: &HashMap<String, String>) -> bool {
-    let expanded = expand_text(expr.trim(), vars);
+    let trimmed = expr.trim();
+    if let Some(result) = try_call(trimmed, vars) {
+        return truthy(&result);
+    }
+    let expanded = expand_text(trimmed, vars);
     eval_truth_raw(expanded.trim(), vars)
 }
 
@@ -227,6 +240,195 @@ fn eval_truth_raw(e: &str, vars: &HashMap<String, String>) -> bool {
         }
     }
     truthy(&lookup(e, vars))
+}
+
+/// Match a fully wrapped `NAME(args)` where NAME is a known function: the first
+/// `(` must balance exactly at the final character, so `LEN(a) + 1` is not a call.
+fn fn_name_at(expr: &str) -> Option<(String, &str)> {
+    let open = expr.find('(')?;
+    let name = expr[..open].trim();
+    let mut chars = name.chars();
+    if !chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return None;
+    }
+    if !expr.ends_with(')') {
+        return None;
+    }
+    let inner = &expr[open + 1..expr.len() - 1];
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    for &b in inner.as_bytes() {
+        match b {
+            b'"' => in_quote = !in_quote,
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 || in_quote {
+        return None;
+    }
+    Some((name.to_ascii_uppercase(), inner))
+}
+
+/// Split on top-level commas, ignoring commas inside quotes:
+/// `a, MIN(1, 2), "x,y"` -> `["a", "MIN(1, 2)", "\"x,y\""]`.
+fn split_args(expr: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut start = 0usize;
+    for (i, &b) in expr.as_bytes().iter().enumerate() {
+        match b {
+            b'"' => in_quote = !in_quote,
+            b'(' if !in_quote => depth += 1,
+            b')' if !in_quote => depth -= 1,
+            b',' if depth == 0 && !in_quote => {
+                out.push(expr[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(expr[start..].trim().to_string());
+    out
+}
+
+/// Evaluate a `FUNC(...)` expression. Quoted string arguments lose their quotes.
+fn try_call(expr: &str, vars: &HashMap<String, String>) -> Option<String> {
+    let (name, inner) = fn_name_at(expr)?;
+    let args = if inner.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_args(inner)
+    };
+    let mut vals = Vec::with_capacity(args.len());
+    for arg in &args {
+        let arg = arg.trim();
+        let arg = if arg.len() >= 2 && arg.starts_with('"') && arg.ends_with('"') {
+            &arg[1..arg.len() - 1]
+        } else {
+            arg
+        };
+        vals.push(eval_value(arg, vars));
+    }
+    call_fn(&name, &vals, vars)
+}
+
+fn num_arg(args: &[String], i: usize) -> Option<f64> {
+    args.get(i).and_then(|s| s.trim().parse::<f64>().ok())
+}
+
+/// AMK-style function library. Names are case-insensitive; string position
+/// arguments are 1-based, `INSTR`/`RAND`-style failures return 0 or the low end.
+fn call_fn(name: &str, args: &[String], _vars: &HashMap<String, String>) -> Option<String> {
+    let s0 = || args.first().map(String::as_str).unwrap_or("");
+    let n0 = |i: usize| num_arg(args, i);
+    Some(match name {
+        "LEN" => s0().chars().count().to_string(),
+        "UPPER" => s0().to_uppercase(),
+        "LOWER" => s0().to_lowercase(),
+        "TRIM" => s0().trim().to_string(),
+        "MID" => {
+            let chars: Vec<char> = s0().chars().collect();
+            let start = (n0(1)?.max(1.0) as usize).min(chars.len().max(1));
+            let rest = &chars[start - 1..];
+            match n0(2) {
+                Some(len) => rest.iter().take(len.max(0.0) as usize).collect(),
+                None => rest.iter().collect(),
+            }
+        }
+        "LEFT" => s0().chars().take(n0(1)?.max(0.0) as usize).collect(),
+        "RIGHT" => {
+            let n = n0(1)?.max(0.0) as usize;
+            let count = s0().chars().count();
+            s0().chars().skip(count.saturating_sub(n)).collect()
+        }
+        "REPLACE" => s0().replace(args.get(1)?.as_str(), args.get(2)?.as_str()),
+        "INSTR" => {
+            let hay = s0();
+            match hay.find(args.get(1)?.as_str()) {
+                Some(byte_i) => (hay[..byte_i].chars().count() + 1).to_string(),
+                None => "0".into(),
+            }
+        }
+        "VAL" => s0()
+            .trim()
+            .parse::<f64>()
+            .map(format_num)
+            .unwrap_or("0".into()),
+        "STR" => n0(0).map(format_num).unwrap_or_else(|| s0().to_string()),
+        "ASC" => s0()
+            .chars()
+            .next()
+            .map(|c| (c as u32).to_string())
+            .unwrap_or("0".into()),
+        "CHR" => char::from_u32(n0(0)? as u32)?.to_string(),
+        "ABS" => format_num(n0(0)?.abs()),
+        "SQRT" => format_num(n0(0)?.sqrt()),
+        "CEIL" => format_num(n0(0)?.ceil()),
+        "FLOOR" => format_num(n0(0)?.floor()),
+        "ROUND" => {
+            let m = 10f64.powi(n0(1).unwrap_or(0.0).clamp(-6.0, 6.0) as i32);
+            format_num((n0(0)? * m).round() / m)
+        }
+        "POW" => format_num(n0(0)?.powf(n0(1)?)),
+        "MOD" => format_num(n0(0)? % n0(1)?),
+        "MIN" => format_num(
+            args.iter()
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?,
+        ),
+        "MAX" => format_num(
+            args.iter()
+                .filter_map(|s| s.trim().parse::<f64>().ok())
+                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?,
+        ),
+        "RAND" => crate::engine::rand_range(n0(0)? as i64, n0(1)? as i64).to_string(),
+        "NOW" => chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        "TODAY" => chrono::Local::now().format("%Y-%m-%d").to_string(),
+        "YEAR" => chrono::Local::now().year().to_string(),
+        "MONTH" => chrono::Local::now().month().to_string(),
+        "DAY" => chrono::Local::now().day().to_string(),
+        "HOUR" => chrono::Local::now().hour().to_string(),
+        "MINUTE" => chrono::Local::now().minute().to_string(),
+        "SECOND" => chrono::Local::now().second().to_string(),
+        "WEEKDAY" => chrono::Local::now()
+            .weekday()
+            .number_from_monday()
+            .to_string(),
+        "TICKS" => chrono::Utc::now().timestamp_millis().to_string(),
+        "FILE_EXISTS" => i8::from(std::path::Path::new(s0()).exists()).to_string(),
+        "FILE_SIZE" => std::fs::metadata(s0())
+            .map(|m| m.len().to_string())
+            .unwrap_or("-1".into()),
+        "FILE_READ" => {
+            // Whole-text helper for small files; oversized files read as "".
+            match std::fs::read(s0()) {
+                Ok(bytes) if bytes.len() <= 1 << 20 => String::from_utf8_lossy(&bytes).into_owned(),
+                _ => String::new(),
+            }
+        }
+        "FILE_WRITE" => {
+            if std::fs::write(s0(), args.get(1).map(String::as_str).unwrap_or("")).is_ok() {
+                "1".to_string()
+            } else {
+                "0".to_string()
+            }
+        }
+        "ENV" => std::env::var(s0()).unwrap_or_default(),
+        "CLIP" => crate::clipboard::get_text().unwrap_or_default(),
+        _ => return None,
+    })
 }
 
 #[cfg(test)]
@@ -306,5 +508,113 @@ mod tests {
         let v = vars(&[("file", "hello-world"), ("n", "4")]);
         assert_eq!(eval_value("file", &v), "hello-world");
         assert_eq!(eval_value("n", &v), "4");
+    }
+
+    #[test]
+    fn string_functions() {
+        let empty = HashMap::new();
+        assert_eq!(eval_value("LEN(abc)", &empty), "3");
+        assert_eq!(eval_value("upper(ab)", &empty), "AB");
+        assert_eq!(eval_value("LOWER(AB)", &empty), "ab");
+        assert_eq!(eval_value("TRIM(  ab  )", &empty), "ab");
+        assert_eq!(eval_value(r#"MID("abcdef", 2, 3)"#, &empty), "bcd");
+        assert_eq!(eval_value("MID(abcdef, 4)", &empty), "def");
+        assert_eq!(eval_value("LEFT(abcdef, 2)", &empty), "ab");
+        assert_eq!(eval_value("RIGHT(abcdef, 2)", &empty), "ef");
+        assert_eq!(eval_value(r#"REPLACE(abcabc, bc, X)"#, &empty), "aXaX");
+        assert_eq!(eval_value(r#"INSTR(abcdef, cd)"#, &empty), "3");
+        assert_eq!(eval_value(r#"INSTR(abcdef, zz)"#, &empty), "0");
+        assert_eq!(eval_value("VAL(3.50)", &empty), "3.5");
+        assert_eq!(eval_value("STR(3.50)", &empty), "3.5");
+        assert_eq!(eval_value("ASC(a)", &empty), "97");
+        assert_eq!(eval_value("CHR(97)", &empty), "a");
+    }
+
+    #[test]
+    fn math_functions() {
+        let empty = HashMap::new();
+        assert_eq!(eval_value("ABS(-3)", &empty), "3");
+        assert_eq!(eval_value("SQRT(16)", &empty), "4");
+        assert_eq!(eval_value("SQRT(16) + 1", &empty), "5");
+        assert_eq!(eval_value("CEIL(1.2)", &empty), "2");
+        assert_eq!(eval_value("FLOOR(1.8)", &empty), "1");
+        assert_eq!(eval_value("ROUND(1.25, 1)", &empty), "1.3");
+        assert_eq!(eval_value("POW(2, 3)", &empty), "8");
+        assert_eq!(eval_value("MOD(7, 4)", &empty), "3");
+        assert_eq!(eval_value("MIN(3, 1, 2)", &empty), "1");
+        assert_eq!(eval_value("MAX(3, 1, 2)", &empty), "3");
+        let v = vars(&[("n", "9")]);
+        assert_eq!(eval_value("SQRT(n)", &v), "3");
+    }
+
+    #[test]
+    fn rand_and_time_functions() {
+        let empty = HashMap::new();
+        let drawn = eval_value("RAND(5, 5)", &empty);
+        assert_eq!(drawn, "5");
+        for _ in 0..20 {
+            let n: i64 = eval_value("RAND(1, 3)", &empty).parse().unwrap();
+            assert!((1..=3).contains(&n));
+        }
+        assert_eq!(eval_value("LEN(NOW())", &empty), "19");
+        assert_eq!(eval_value("LEN(TODAY())", &empty), "10");
+        let year: i64 = eval_value("YEAR()", &empty).parse().unwrap();
+        assert!(year > 2020);
+        let wd: i64 = eval_value("WEEKDAY()", &empty).parse().unwrap();
+        assert!((1..=7).contains(&wd));
+    }
+
+    #[test]
+    fn file_functions_roundtrip() {
+        let empty = HashMap::new();
+        let mut path = std::env::temp_dir();
+        path.push(format!("amk-eval-{}.txt", std::process::id()));
+        let p = path.to_string_lossy().replace('\\', "/");
+        assert_eq!(eval_value(&format!("FILE_EXISTS({p})"), &empty), "0");
+        assert_eq!(
+            eval_value(&format!(r#"FILE_WRITE({p}, "hello fn")"#), &empty),
+            "1"
+        );
+        assert_eq!(eval_value(&format!("FILE_EXISTS({p})"), &empty), "1");
+        assert_eq!(eval_value(&format!("FILE_READ({p})"), &empty), "hello fn");
+        assert!(
+            eval_value(&format!("FILE_SIZE({p})"), &empty)
+                .parse::<i64>()
+                .unwrap()
+                > 0
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn env_and_clip_functions_degrade_gracefully() {
+        let empty = HashMap::new();
+        assert_eq!(eval_value(r#"ENV(AMK_NO_SUCH_VAR_XYZ)"#, &empty), "");
+        // Depends on machine state; the contract is only that it returns text.
+        let _clip = eval_value("CLIP()", &empty);
+    }
+
+    #[test]
+    fn nested_calls_and_quoted_args() {
+        let empty = HashMap::new();
+        assert_eq!(eval_value(r#"UPPER(TRIM(  ab  ))"#, &empty), "AB");
+        assert_eq!(eval_value(r#"LEN(LEFT(abcdef, 3))"#, &empty), "3");
+        assert_eq!(eval_value(r#"MID("a,b,c", 2, 1)"#, &empty), ",");
+    }
+
+    #[test]
+    fn unknown_call_shape_stays_text() {
+        let empty = HashMap::new();
+        assert_eq!(eval_value("NOFUNC(1)", &empty), "NOFUNC(1)");
+        assert_eq!(eval_value("LEN(a) + LEN(b)", &empty), "2");
+    }
+
+    #[test]
+    fn functions_inside_truth() {
+        let empty = HashMap::new();
+        assert!(eval_truth("LEN(abc) == 3", &empty));
+        assert!(eval_truth("MAX(1, 5) == 5", &empty));
+        assert!(!eval_truth("INSTR(abc, z) > 0", &empty));
+        assert!(eval_truth(r#"TRIM( x ) == x"#, &empty));
     }
 }

@@ -42,6 +42,8 @@ enum Dialog {
     Schedule,
     Clicker,
     Presser,
+    Registry,
+    RenameVar,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +95,8 @@ pub struct AmkApp {
     draft: ActionKind,
     draft_name: String,
     draft_delay: u64,
+    rename_from: String,
+    rename_to: String,
     status: String,
     clipboard: Vec<Action>,
     undo: Vec<Script>,
@@ -155,6 +159,8 @@ impl AmkApp {
             draft: ActionKind::Delay { ms: 500 },
             draft_name: String::new(),
             draft_delay: 0,
+            rename_from: String::new(),
+            rename_to: String::new(),
             clipboard: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -271,6 +277,14 @@ impl AmkApp {
                     a.name = a.kind.default_name();
                 }
             }
+        }
+    }
+
+    fn set_lang(&mut self, lang: Lang) {
+        self.lang = lang;
+        self.sync_placeholder_comment();
+        if !self.recorder.is_running() && self.engine.snapshot_state() == RunState::Idle {
+            self.status = t(self.lang, "status_ready").to_string();
         }
     }
 
@@ -683,17 +697,23 @@ impl AmkApp {
             ActionKind::SearchPicture { .. } => Dialog::Search,
             ActionKind::ActivateWindow { .. }
             | ActionKind::CloseWindow { .. }
-            | ActionKind::WaitWindow { .. } => Dialog::Window,
+            | ActionKind::WaitWindow { .. }
+            | ActionKind::MinimizeWindow { .. }
+            | ActionKind::MaximizeWindow { .. }
+            | ActionKind::RestoreWindow { .. } => Dialog::Window,
             ActionKind::SetClipboard { .. }
             | ActionKind::GetClipboard { .. }
-            | ActionKind::WaitClipboard { .. } => Dialog::Clipboard,
+            | ActionKind::WaitClipboard { .. }
+            | ActionKind::SetClipboardHtml { .. }
+            | ActionKind::GetClipboardHtml { .. } => Dialog::Clipboard,
             ActionKind::OpenFile { .. }
             | ActionKind::OpenUrl { .. }
             | ActionKind::OpenFolder { .. } => Dialog::File,
             ActionKind::SetVar { .. } => Dialog::Variable,
             ActionKind::Switch { .. } => Dialog::Switch,
             ActionKind::Case { .. } => Dialog::Case,
-            ActionKind::ReadJson { .. } => Dialog::Json,
+            ActionKind::ReadJson { .. } | ActionKind::WriteJson { .. } => Dialog::Json,
+            ActionKind::ReadRegistry { .. } | ActionKind::WriteRegistry { .. } => Dialog::Registry,
             ActionKind::If { .. } => Dialog::If,
             ActionKind::For { .. } => Dialog::For,
             ActionKind::While { .. } => Dialog::While,
@@ -1250,7 +1270,7 @@ impl eframe::App for AmkApp {
                         } else if self.recorder.is_running() {
                             (Color32::from_rgb(196, 48, 48), &self.status)
                         } else {
-                            (Color32::from_rgb(92, 107, 122), &self.status)
+                            (Color32::from_rgb(72, 86, 100), &self.status)
                         };
 
                         let (dot, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
@@ -1267,7 +1287,7 @@ impl eframe::App for AmkApp {
                             let current = self.selected.map(|i| i + 1).unwrap_or(0);
                             ui.label(
                                 RichText::new(tf(self.lang, "line_of", current, total))
-                                    .size(11.0)
+                                    .size(12.0)
                                     .color(Color32::from_rgb(60, 60, 60)),
                             );
                         });
@@ -1664,6 +1684,17 @@ impl AmkApp {
                             );
                             ui.close_menu();
                         }
+                        if ui.button(t(self.lang, "insert_registry")).clicked() {
+                            self.open_edit(
+                                ActionKind::ReadRegistry {
+                                    path: r"HKCU\Software\".into(),
+                                    value: String::new(),
+                                    name: "reg".into(),
+                                },
+                                None,
+                            );
+                            ui.close_menu();
+                        }
                         if ui.button(t(self.lang, "insert_play_random")).clicked() {
                             self.open_edit(
                                 ActionKind::PlayRandom {
@@ -1754,6 +1785,12 @@ impl AmkApp {
                             self.script.optimize_record();
                             ui.close_menu();
                         }
+                        if ui.button(t(self.lang, "menu_rename_var")).clicked() {
+                            self.rename_from.clear();
+                            self.rename_to.clear();
+                            self.dialog = Dialog::RenameVar;
+                            ui.close_menu();
+                        }
                         ui.separator();
                         if ui.button(t(self.lang, "mouse_clicker")).clicked() {
                             self.dialog = Dialog::Clicker;
@@ -1776,24 +1813,6 @@ impl AmkApp {
                         ui.checkbox(&mut self.show_toolbox, t(self.lang, "toolbox"));
                         ui.checkbox(&mut self.show_play_opts, t(self.lang, "play_options"));
                         ui.checkbox(&mut self.show_status, t(self.lang, "status_bar"));
-                        ui.separator();
-                        ui.label(t(self.lang, "language"));
-                        if ui
-                            .selectable_label(self.lang == Lang::En, "English")
-                            .clicked()
-                        {
-                            self.lang = Lang::En;
-                            self.sync_placeholder_comment();
-                            ui.close_menu();
-                        }
-                        if ui
-                            .selectable_label(self.lang == Lang::Vi, "Tiếng Việt")
-                            .clicked()
-                        {
-                            self.lang = Lang::Vi;
-                            self.sync_placeholder_comment();
-                            ui.close_menu();
-                        }
                     });
                     ui.menu_button(t(self.lang, "menu_help"), |ui| {
                         if ui.button(t(self.lang, "help_contents")).clicked() {
@@ -2055,24 +2074,6 @@ impl AmkApp {
                             {
                                 self.dialog = Dialog::Help;
                             }
-
-                            ui.add_space(8.0);
-                            let lab = self.lang.label().to_string();
-                            if ui
-                                .add(
-                                    egui::Button::new(RichText::new(lab).strong())
-                                        .min_size(Vec2::new(44.0, 28.0)),
-                                )
-                                .clicked()
-                            {
-                                self.lang = self.lang.toggle();
-                                self.sync_placeholder_comment();
-                                if !self.recorder.is_running()
-                                    && self.engine.snapshot_state() == RunState::Idle
-                                {
-                                    self.status = t(self.lang, "status_ready").to_string();
-                                }
-                            }
                         });
                     });
                 ui.add_space(4.0);
@@ -2164,9 +2165,9 @@ impl AmkApp {
                                 ui.add_space(16.0);
                                 ui.label(
                                     RichText::new(t(self.lang, group_title))
-                                        .size(11.0)
+                                        .size(12.0)
                                         .strong()
-                                        .color(Color32::from_rgb(130, 140, 150)),
+                                        .color(Color32::from_rgb(96, 106, 118)),
                                 );
                             });
                             ui.add_space(6.0);
@@ -2458,8 +2459,8 @@ impl AmkApp {
                         };
                         (
                             nc,
-                            Color32::from_rgb(92, 107, 122),
-                            Color32::from_rgb(92, 107, 122),
+                            Color32::from_rgb(72, 86, 100),
+                            Color32::from_rgb(72, 86, 100),
                         )
                     };
 
@@ -2477,8 +2478,8 @@ impl AmkApp {
 
                     let mut x = rect.min.x;
                     let row_line = Stroke::new(1.0_f32, Color32::from_rgb(236, 238, 242));
-                    let body = egui::FontId::proportional(13.0);
-                    let small = egui::FontId::monospace(12.0);
+                    let body = egui::FontId::proportional(14.0);
+                    let small = egui::FontId::monospace(13.0);
 
                     let id_rect = egui::Rect::from_min_size(
                         egui::pos2(x + 10.0, rect.top()),
@@ -2828,8 +2829,8 @@ impl AmkApp {
                 });
                 ui.label(
                     RichText::new(t(self.lang, "hk_more"))
-                        .size(11.0)
-                        .color(Color32::from_rgb(122, 132, 144)),
+                        .size(12.0)
+                        .color(Color32::from_rgb(96, 106, 118)),
                 );
             });
 
@@ -2975,6 +2976,8 @@ impl AmkApp {
             Dialog::Schedule => t(self.lang, "dlg_schedule"),
             Dialog::Clicker => t(self.lang, "dlg_clicker"),
             Dialog::Presser => t(self.lang, "dlg_presser"),
+            Dialog::Registry => t(self.lang, "dlg_registry"),
+            Dialog::RenameVar => t(self.lang, "menu_rename_var"),
             Dialog::None => "",
         }
         .to_string();
@@ -3005,6 +3008,7 @@ impl AmkApp {
                         | Dialog::Clicker
                         | Dialog::Presser
                         | Dialog::Clipboard
+                        | Dialog::RenameVar
                 ) {
                     ui.horizontal(|ui| {
                         ui.label(t(self.lang, "step_name"));
@@ -3037,6 +3041,8 @@ impl AmkApp {
                     Dialog::Clipboard => self.ui_clipboard(ui),
                     Dialog::Switch | Dialog::Case => self.ui_switch_case(ui),
                     Dialog::Json => self.ui_json(ui),
+                    Dialog::Registry => self.ui_registry(ui),
+                    Dialog::RenameVar => self.ui_rename_var(ui),
                     Dialog::Variable => {
                         if let ActionKind::SetVar { name, value } = &mut self.draft {
                             ui.horizontal(|ui| {
@@ -3129,6 +3135,22 @@ impl AmkApp {
                     }
                     Dialog::Options => {
                         ui.spacing_mut().interact_size.y = 24.0;
+                        let lang_before = self.lang;
+                        Self::option_row(ui, |ui| {
+                            ui.label(t(self.lang, "language"));
+                            egui::ComboBox::from_id_source("ui_language")
+                                .selected_text(match self.lang {
+                                    Lang::En => "English",
+                                    Lang::Vi => "Tiếng Việt",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.lang, Lang::En, "English");
+                                    ui.selectable_value(&mut self.lang, Lang::Vi, "Tiếng Việt");
+                                });
+                        });
+                        if self.lang != lang_before {
+                            self.set_lang(self.lang);
+                        }
                         Self::option_row(ui, |ui| {
                             ui.checkbox(
                                 &mut self.options.minimize_on_play,
@@ -3214,7 +3236,7 @@ impl AmkApp {
                         if self.tasks.is_empty() {
                             ui.label(
                                 RichText::new(t(self.lang, "schedule_empty"))
-                                    .color(Color32::from_rgb(110, 120, 132)),
+                                    .color(Color32::from_rgb(96, 106, 118)),
                             );
                         }
                         if ui.button(t(self.lang, "add_task")).clicked() {
@@ -3530,12 +3552,16 @@ impl AmkApp {
         let mut mode = match &self.draft {
             ActionKind::GetClipboard { .. } => 1,
             ActionKind::WaitClipboard { .. } => 2,
+            ActionKind::SetClipboardHtml { .. } => 3,
+            ActionKind::GetClipboardHtml { .. } => 4,
             _ => 0,
         };
         ui.horizontal(|ui| {
             ui.selectable_value(&mut mode, 0, t(self.lang, "clip_set"));
             ui.selectable_value(&mut mode, 1, t(self.lang, "clip_get"));
             ui.selectable_value(&mut mode, 2, t(self.lang, "clip_wait"));
+            ui.selectable_value(&mut mode, 3, t(self.lang, "clip_set_html"));
+            ui.selectable_value(&mut mode, 4, t(self.lang, "clip_get_html"));
         });
         if mode == 2 {
             let (mut exclude, mut save_name, mut timeout_ms, mut on_fail) = match &self.draft {
@@ -3588,6 +3614,29 @@ impl AmkApp {
                     ui.text_edit_singleline(&mut text);
                 });
                 self.draft = ActionKind::SetClipboard { text };
+            }
+            3 => {
+                let mut html = match &self.draft {
+                    ActionKind::SetClipboardHtml { html } => html.clone(),
+                    _ => String::new(),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(t(self.lang, "clip_html"));
+                    ui.text_edit_singleline(&mut html);
+                });
+                ui.label(t(self.lang, "clip_html_hint"));
+                self.draft = ActionKind::SetClipboardHtml { html };
+            }
+            4 => {
+                let mut name = match &self.draft {
+                    ActionKind::GetClipboardHtml { name } => name.clone(),
+                    _ => "html".into(),
+                };
+                ui.horizontal(|ui| {
+                    ui.label(t(self.lang, "clip_var"));
+                    ui.text_edit_singleline(&mut name);
+                });
+                self.draft = ActionKind::GetClipboardHtml { name };
             }
             _ => {
                 let mut name = match &self.draft {
@@ -3706,20 +3755,128 @@ impl AmkApp {
     }
 
     fn ui_json(&mut self, ui: &mut egui::Ui) {
-        if let ActionKind::ReadJson { file, query, name } = &mut self.draft {
-            ui.horizontal(|ui| {
-                ui.label(t(self.lang, "json_file"));
-                ui.text_edit_singleline(file);
-            });
-            ui.horizontal(|ui| {
-                ui.label(t(self.lang, "json_query"));
-                ui.text_edit_singleline(query);
-            });
+        let mut mode = match &self.draft {
+            ActionKind::WriteJson { .. } => 1,
+            _ => 0,
+        };
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut mode, 0, t(self.lang, "json_read"));
+            ui.selectable_value(&mut mode, 1, t(self.lang, "json_write"));
+        });
+        let (mut file, mut query) = match &self.draft {
+            ActionKind::ReadJson { file, query, .. }
+            | ActionKind::WriteJson { file, query, .. } => (file.clone(), query.clone()),
+            _ => (String::new(), String::new()),
+        };
+        ui.horizontal(|ui| {
+            ui.label(t(self.lang, "json_file"));
+            ui.text_edit_singleline(&mut file);
+        });
+        ui.horizontal(|ui| {
+            ui.label(t(self.lang, "json_query"));
+            ui.text_edit_singleline(&mut query);
+        });
+        if mode == 0 {
+            let mut name = match &self.draft {
+                ActionKind::ReadJson { name, .. } => name.clone(),
+                _ => "json".into(),
+            };
             ui.horizontal(|ui| {
                 ui.label(t(self.lang, "var_name"));
-                ui.text_edit_singleline(name);
+                ui.text_edit_singleline(&mut name);
             });
-            ui.label(t(self.lang, "json_hint"));
+            self.draft = ActionKind::ReadJson { file, query, name };
+        } else {
+            let mut value = match &self.draft {
+                ActionKind::WriteJson { value, .. } => value.clone(),
+                _ => String::new(),
+            };
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "json_value"));
+                ui.text_edit_singleline(&mut value);
+            });
+            self.draft = ActionKind::WriteJson { file, query, value };
+        }
+        ui.label(t(
+            self.lang,
+            if mode == 0 {
+                "json_hint"
+            } else {
+                "json_write_hint"
+            },
+        ));
+    }
+
+    fn ui_registry(&mut self, ui: &mut egui::Ui) {
+        let mut mode = match &self.draft {
+            ActionKind::WriteRegistry { .. } => 1,
+            _ => 0,
+        };
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut mode, 0, t(self.lang, "reg_read"));
+            ui.selectable_value(&mut mode, 1, t(self.lang, "reg_write"));
+        });
+        let (mut path, mut value) = match &self.draft {
+            ActionKind::ReadRegistry { path, value, .. }
+            | ActionKind::WriteRegistry { path, value, .. } => (path.clone(), value.clone()),
+            _ => (String::new(), String::new()),
+        };
+        ui.horizontal(|ui| {
+            ui.label(t(self.lang, "reg_path"));
+            ui.text_edit_singleline(&mut path);
+        });
+        ui.horizontal(|ui| {
+            ui.label(t(self.lang, "reg_value"));
+            ui.text_edit_singleline(&mut value);
+        });
+        if mode == 0 {
+            let mut name = match &self.draft {
+                ActionKind::ReadRegistry { name, .. } => name.clone(),
+                _ => "reg".into(),
+            };
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "var_name"));
+                ui.text_edit_singleline(&mut name);
+            });
+            self.draft = ActionKind::ReadRegistry { path, value, name };
+        } else {
+            let mut data = match &self.draft {
+                ActionKind::WriteRegistry { data, .. } => data.clone(),
+                _ => String::new(),
+            };
+            ui.horizontal(|ui| {
+                ui.label(t(self.lang, "reg_data"));
+                ui.text_edit_singleline(&mut data);
+            });
+            self.draft = ActionKind::WriteRegistry { path, value, data };
+        }
+        ui.label(t(self.lang, "reg_hint"));
+    }
+
+    fn ui_rename_var(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(t(self.lang, "rename_from"));
+            ui.text_edit_singleline(&mut self.rename_from);
+        });
+        ui.horizontal(|ui| {
+            ui.label(t(self.lang, "rename_to"));
+            ui.text_edit_singleline(&mut self.rename_to);
+        });
+        ui.label(t(self.lang, "rename_hint"));
+        ui.add_space(4.0);
+        if ui
+            .add(egui::Button::new(t(self.lang, "rename_apply")))
+            .clicked()
+        {
+            self.snapshot();
+            let changed = self
+                .script
+                .rename_variable(&self.rename_from, &self.rename_to);
+            if changed > 0 {
+                self.dirty = true;
+            }
+            self.status = format!("{}: {changed}", t(self.lang, "rename_done"));
+            self.dialog = Dialog::None;
         }
     }
 
@@ -3727,16 +3884,25 @@ impl AmkApp {
         let mut mode = match &self.draft {
             ActionKind::CloseWindow { .. } => 1,
             ActionKind::WaitWindow { .. } => 2,
+            ActionKind::MinimizeWindow { .. } => 3,
+            ActionKind::MaximizeWindow { .. } => 4,
+            ActionKind::RestoreWindow { .. } => 5,
             _ => 0,
         };
         ui.horizontal(|ui| {
             ui.selectable_value(&mut mode, 0, t(self.lang, "win_activate"));
             ui.selectable_value(&mut mode, 1, t(self.lang, "win_close"));
             ui.selectable_value(&mut mode, 2, t(self.lang, "win_wait"));
+            ui.selectable_value(&mut mode, 3, t(self.lang, "win_min"));
+            ui.selectable_value(&mut mode, 4, t(self.lang, "win_max"));
+            ui.selectable_value(&mut mode, 5, t(self.lang, "win_restore"));
         });
         let mut title = match &self.draft {
             ActionKind::ActivateWindow { title }
             | ActionKind::CloseWindow { title }
+            | ActionKind::MinimizeWindow { title }
+            | ActionKind::MaximizeWindow { title }
+            | ActionKind::RestoreWindow { title }
             | ActionKind::WaitWindow { title, .. } => title.clone(),
             _ => String::new(),
         };
@@ -3768,10 +3934,12 @@ impl AmkApp {
             };
             return;
         }
-        self.draft = if mode == 1 {
-            ActionKind::CloseWindow { title }
-        } else {
-            ActionKind::ActivateWindow { title }
+        self.draft = match mode {
+            1 => ActionKind::CloseWindow { title },
+            3 => ActionKind::MinimizeWindow { title },
+            4 => ActionKind::MaximizeWindow { title },
+            5 => ActionKind::RestoreWindow { title },
+            _ => ActionKind::ActivateWindow { title },
         };
     }
 
@@ -4038,7 +4206,7 @@ fn header_cell(ui: &mut egui::Ui, text: &str, w: f32, h: f32) {
         text_rect,
         text,
         egui::FontId::proportional(12.0),
-        Color32::from_rgb(92, 107, 122),
+        Color32::from_rgb(72, 86, 100),
     );
 }
 

@@ -250,6 +250,42 @@ pub enum ActionKind {
     PlayScript {
         path: String,
     },
+    /// Write a value into a JSON file at a dot path (`a.b.0.c`), creating the
+    /// file and intermediate objects/arrays as needed.
+    WriteJson {
+        file: String,
+        query: String,
+        value: String,
+    },
+    /// Read a registry string value into a variable. Path: `HKCU\Software\...`.
+    ReadRegistry {
+        path: String,
+        value: String,
+        name: String,
+    },
+    /// Write a registry string value. Path: `HKCU\Software\...`.
+    WriteRegistry {
+        path: String,
+        value: String,
+        data: String,
+    },
+    MinimizeWindow {
+        title: String,
+    },
+    MaximizeWindow {
+        title: String,
+    },
+    RestoreWindow {
+        title: String,
+    },
+    /// Put HTML on the clipboard (Windows "HTML Format").
+    SetClipboardHtml {
+        html: String,
+    },
+    /// Read HTML from the clipboard into a variable.
+    GetClipboardHtml {
+        name: String,
+    },
 }
 
 impl ActionKind {
@@ -305,6 +341,14 @@ impl ActionKind {
             ActionKind::MessageBox { .. } => "act_msg",
             ActionKind::CallFunction { .. } => "act_call",
             ActionKind::PlayScript { .. } => "act_play_script",
+            ActionKind::WriteJson { .. } => "act_write_json",
+            ActionKind::ReadRegistry { .. } => "act_read_reg",
+            ActionKind::WriteRegistry { .. } => "act_write_reg",
+            ActionKind::MinimizeWindow { .. } => "act_win_min",
+            ActionKind::MaximizeWindow { .. } => "act_win_max",
+            ActionKind::RestoreWindow { .. } => "act_win_restore",
+            ActionKind::SetClipboardHtml { .. } => "act_set_clip_html",
+            ActionKind::GetClipboardHtml { .. } => "act_get_clip_html",
         }
     }
 
@@ -459,6 +503,31 @@ impl ActionKind {
             ActionKind::WaitTime { .. } => ("Wait Time".into(), "".into(), "".into()),
             ActionKind::RandomNumber { .. } => ("Random Number".into(), "".into(), "".into()),
             ActionKind::Command { cmd, .. } => ("Run Command".into(), cmd.clone(), "".into()),
+            ActionKind::WriteJson { file, query, .. } => {
+                ("Write JSON".into(), file.clone(), query.clone())
+            }
+            ActionKind::ReadRegistry { path, value, .. } => {
+                ("Read Registry".into(), path.clone(), value.clone())
+            }
+            ActionKind::WriteRegistry { path, value, .. } => {
+                ("Write Registry".into(), path.clone(), value.clone())
+            }
+            ActionKind::MinimizeWindow { title } => {
+                ("Minimize Window".into(), title.clone(), "".into())
+            }
+            ActionKind::MaximizeWindow { title } => {
+                ("Maximize Window".into(), title.clone(), "".into())
+            }
+            ActionKind::RestoreWindow { title } => {
+                ("Restore Window".into(), title.clone(), "".into())
+            }
+            ActionKind::SetClipboardHtml { html } => {
+                let shown: String = html.chars().take(40).collect();
+                ("Set Clipboard HTML".into(), shown, "".into())
+            }
+            ActionKind::GetClipboardHtml { name } => {
+                ("Get Clipboard HTML".into(), name.clone(), "".into())
+            }
         }
     }
 
@@ -572,6 +641,23 @@ impl ActionKind {
             ActionKind::WaitTime { hh, mm } => format!("WaitTime  {:02}:{:02}", hh, mm),
             ActionKind::RandomNumber { name, a, b } => format!("Random {} = {}..{}", name, a, b),
             ActionKind::Command { cmd } => format!("Command  {}", cmd),
+            ActionKind::WriteJson { file, query, .. } => {
+                format!("Write JSON  {} :: {}", file, query)
+            }
+            ActionKind::ReadRegistry { path, value, .. } => {
+                format!("Read Registry  {} :: {}", path, value)
+            }
+            ActionKind::WriteRegistry { path, value, .. } => {
+                format!("Write Registry  {} :: {}", path, value)
+            }
+            ActionKind::MinimizeWindow { title } => format!("Minimize Window  {}", title),
+            ActionKind::MaximizeWindow { title } => format!("Maximize Window  {}", title),
+            ActionKind::RestoreWindow { title } => format!("Restore Window  {}", title),
+            ActionKind::SetClipboardHtml { html } => {
+                let shown: String = html.chars().take(40).collect();
+                format!("Set Clipboard HTML  \"{}\"", shown)
+            }
+            ActionKind::GetClipboardHtml { name } => format!("Get Clipboard HTML  ->  {}", name),
         }
     }
 
@@ -751,6 +837,160 @@ impl Script {
             }
         }
         self.actions = out;
+    }
+
+    /// AMK "Rename a variable": renames every assignment, `{name}` reference,
+    /// and whole-word use inside If/While/Switch expressions. Returns how many
+    /// fields changed.
+    pub fn rename_variable(&mut self, from: &str, to: &str) -> usize {
+        if from.is_empty() || to.is_empty() || from == to {
+            return 0;
+        }
+        let brace_from = format!("{{{from}}}");
+        let brace_to = format!("{{{to}}}");
+        let mut count = 0usize;
+        for a in &mut self.actions {
+            count += a.kind.rename_variable(from, to, &brace_from, &brace_to);
+        }
+        count
+    }
+}
+
+fn rename_name(slot: &mut String, from: &str, to: &str, count: &mut usize) {
+    if slot == from {
+        *slot = to.to_string();
+        *count += 1;
+    }
+}
+
+fn rename_braces(slot: &mut String, brace_from: &str, brace_to: &str, count: &mut usize) {
+    if slot.contains(brace_from) {
+        *slot = slot.replace(brace_from, brace_to);
+        *count += 1;
+    }
+}
+
+/// Whole-word replacement for expressions: `n + 1` and `{n}` both match `n`,
+/// but `xn` or a quoted `"n"` inside a longer token does not.
+fn rename_expr(slot: &mut String, from: &str, to: &str, count: &mut usize) {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(slot.len());
+    let mut rest = slot.as_str();
+    let mut changed = false;
+    while let Some(i) = rest.find(from) {
+        let before_ok = rest[..i].chars().next_back().is_none_or(|c| !is_word(c));
+        let after = &rest[i + from.len()..];
+        let after_ok = after.chars().next().is_none_or(|c| !is_word(c));
+        if before_ok && after_ok {
+            out.push_str(&rest[..i]);
+            out.push_str(to);
+            rest = after;
+            changed = true;
+        } else {
+            let skip = rest[i..].chars().next().map_or(1, char::len_utf8);
+            out.push_str(&rest[..i + skip]);
+            rest = &rest[i + skip..];
+        }
+    }
+    if changed {
+        out.push_str(rest);
+        *slot = out;
+        *count += 1;
+    }
+}
+
+impl ActionKind {
+    fn rename_variable(&mut self, from: &str, to: &str, brace_from: &str, brace_to: &str) -> usize {
+        let mut count = 0usize;
+        match self {
+            ActionKind::SetVar { name, value } => {
+                rename_name(name, from, to, &mut count);
+                rename_braces(value, brace_from, brace_to, &mut count);
+            }
+            ActionKind::For { var, .. } => rename_name(var, from, to, &mut count),
+            ActionKind::RandomNumber { name, .. } => rename_name(name, from, to, &mut count),
+            ActionKind::GetClipboard { name } => rename_name(name, from, to, &mut count),
+            ActionKind::GetClipboardHtml { name } => rename_name(name, from, to, &mut count),
+            ActionKind::ReadJson { file, query, name } => {
+                rename_name(name, from, to, &mut count);
+                rename_braces(file, brace_from, brace_to, &mut count);
+                rename_braces(query, brace_from, brace_to, &mut count);
+            }
+            ActionKind::WriteJson { file, query, value } => {
+                rename_braces(file, brace_from, brace_to, &mut count);
+                rename_braces(query, brace_from, brace_to, &mut count);
+                rename_braces(value, brace_from, brace_to, &mut count);
+            }
+            ActionKind::ReadRegistry { path, value, name } => {
+                rename_name(name, from, to, &mut count);
+                rename_braces(path, brace_from, brace_to, &mut count);
+                rename_braces(value, brace_from, brace_to, &mut count);
+            }
+            ActionKind::WriteRegistry { path, value, data } => {
+                rename_braces(path, brace_from, brace_to, &mut count);
+                rename_braces(value, brace_from, brace_to, &mut count);
+                rename_braces(data, brace_from, brace_to, &mut count);
+            }
+            ActionKind::WaitClipboard {
+                exclude, save_name, ..
+            } => {
+                rename_name(save_name, from, to, &mut count);
+                rename_braces(exclude, brace_from, brace_to, &mut count);
+            }
+            ActionKind::SearchPicture {
+                image,
+                save_x,
+                save_y,
+                ..
+            } => {
+                rename_braces(image, brace_from, brace_to, &mut count);
+                rename_name(save_x, from, to, &mut count);
+                rename_name(save_y, from, to, &mut count);
+            }
+            ActionKind::SmartClick { image, .. } => {
+                rename_braces(image, brace_from, brace_to, &mut count)
+            }
+            ActionKind::RandomMouse { save_x, save_y, .. } => {
+                rename_name(save_x, from, to, &mut count);
+                rename_name(save_y, from, to, &mut count);
+            }
+            ActionKind::TypeText { text, .. } => {
+                rename_braces(text, brace_from, brace_to, &mut count)
+            }
+            ActionKind::KeyPress { key }
+            | ActionKind::KeyDown { key }
+            | ActionKind::KeyUp { key } => rename_braces(key, brace_from, brace_to, &mut count),
+            ActionKind::Command { cmd } => rename_braces(cmd, brace_from, brace_to, &mut count),
+            ActionKind::ActivateWindow { title }
+            | ActionKind::CloseWindow { title }
+            | ActionKind::MinimizeWindow { title }
+            | ActionKind::MaximizeWindow { title }
+            | ActionKind::RestoreWindow { title }
+            | ActionKind::WaitWindow { title, .. } => {
+                rename_braces(title, brace_from, brace_to, &mut count)
+            }
+            ActionKind::SetClipboard { text } => {
+                rename_braces(text, brace_from, brace_to, &mut count)
+            }
+            ActionKind::SetClipboardHtml { html } => {
+                rename_braces(html, brace_from, brace_to, &mut count)
+            }
+            ActionKind::OpenFile { path }
+            | ActionKind::OpenFolder { path }
+            | ActionKind::PlayScript { path } => {
+                rename_braces(path, brace_from, brace_to, &mut count)
+            }
+            ActionKind::OpenUrl { url } => rename_braces(url, brace_from, brace_to, &mut count),
+            ActionKind::PlayRandom { folder } => {
+                rename_braces(folder, brace_from, brace_to, &mut count)
+            }
+            ActionKind::If { expr } | ActionKind::While { expr } | ActionKind::Switch { expr } => {
+                rename_expr(expr, from, to, &mut count)
+            }
+            ActionKind::Case { value } => rename_braces(value, brace_from, brace_to, &mut count),
+            _ => {}
+        }
+        count
     }
 }
 
@@ -1648,5 +1888,138 @@ mod tests {
 
         let garbage = r#"{"actions":[1,2,3]}"#;
         assert!(Script::load_json(garbage).is_err());
+    }
+
+    #[test]
+    fn new_parity_kinds_roundtrip_through_json() {
+        let sc = Script {
+            version: "1.0".into(),
+            name: "parity".into(),
+            actions: vec![
+                Action::new(ActionKind::WriteJson {
+                    file: "out.json".into(),
+                    query: "a.b.0".into(),
+                    value: "42".into(),
+                }),
+                Action::new(ActionKind::ReadRegistry {
+                    path: r"HKCU\Software\AMK".into(),
+                    value: "LastRun".into(),
+                    name: "last".into(),
+                }),
+                Action::new(ActionKind::WriteRegistry {
+                    path: r"HKCU\Software\AMK".into(),
+                    value: "LastRun".into(),
+                    data: "today".into(),
+                }),
+                Action::new(ActionKind::MinimizeWindow {
+                    title: "Notepad".into(),
+                }),
+                Action::new(ActionKind::MaximizeWindow {
+                    title: "Notepad".into(),
+                }),
+                Action::new(ActionKind::RestoreWindow {
+                    title: "Notepad".into(),
+                }),
+                Action::new(ActionKind::SetClipboardHtml {
+                    html: "<b>hi</b>".into(),
+                }),
+                Action::new(ActionKind::GetClipboardHtml {
+                    name: "html".into(),
+                }),
+            ],
+        };
+        let json = sc.to_json().expect("serialize");
+        let back = Script::load_json(&json).expect("deserialize");
+        assert_eq!(back.actions.len(), 8);
+        assert!(matches!(
+            &back.actions[0].kind,
+            ActionKind::WriteJson { .. }
+        ));
+        assert!(matches!(
+            &back.actions[1].kind,
+            ActionKind::ReadRegistry { .. }
+        ));
+        assert!(matches!(
+            &back.actions[2].kind,
+            ActionKind::WriteRegistry { .. }
+        ));
+        assert!(matches!(
+            &back.actions[3].kind,
+            ActionKind::MinimizeWindow { .. }
+        ));
+        assert!(matches!(
+            &back.actions[4].kind,
+            ActionKind::MaximizeWindow { .. }
+        ));
+        assert!(matches!(
+            &back.actions[5].kind,
+            ActionKind::RestoreWindow { .. }
+        ));
+        assert!(matches!(
+            &back.actions[6].kind,
+            ActionKind::SetClipboardHtml { .. }
+        ));
+        assert!(matches!(
+            &back.actions[7].kind,
+            ActionKind::GetClipboardHtml { .. }
+        ));
+        assert_eq!(back.actions[0].kind.type_key(), "act_write_json");
+        assert_eq!(back.actions[3].kind.type_key(), "act_win_min");
+        assert_eq!(back.actions[6].kind.type_key(), "act_set_clip_html");
+    }
+
+    #[test]
+    fn rename_variable_renames_names_braces_and_expr_words() {
+        let mut sc = Script {
+            version: "1.0".into(),
+            name: "ren".into(),
+            actions: vec![
+                Action::new(ActionKind::SetVar {
+                    name: "n".into(),
+                    value: "{n} + 1".into(),
+                }),
+                Action::new(ActionKind::If {
+                    expr: "n > 2 and xn == n".into(),
+                }),
+                Action::new(ActionKind::For {
+                    var: "n".into(),
+                    from: 1,
+                    to: 5,
+                    step: 1,
+                }),
+                Action::new(ActionKind::GetClipboard { name: "n".into() }),
+                Action::new(ActionKind::While {
+                    expr: "{n} == 1".into(),
+                }),
+            ],
+        };
+        let changed = sc.rename_variable("n", "count");
+        // SetVar name, SetVar value braces, If expr, For var,
+        // GetClipboard name, While expr braces — one per field.
+        assert_eq!(changed, 6);
+        assert!(matches!(
+            &sc.actions[0].kind,
+            ActionKind::SetVar { name, value }
+                if name == "count" && value == "{count} + 1"
+        ));
+        assert!(matches!(
+            &sc.actions[1].kind,
+            ActionKind::If { expr } if expr == "count > 2 and xn == count"
+        ));
+        assert!(matches!(
+            &sc.actions[2].kind,
+            ActionKind::For { var, .. } if var == "count"
+        ));
+        assert!(matches!(
+            &sc.actions[3].kind,
+            ActionKind::GetClipboard { name } if name == "count"
+        ));
+    }
+
+    #[test]
+    fn rename_variable_ignores_empty_and_same_names() {
+        let mut sc = Script::default();
+        assert_eq!(sc.rename_variable("", "x"), 0);
+        assert_eq!(sc.rename_variable("n", "n"), 0);
     }
 }

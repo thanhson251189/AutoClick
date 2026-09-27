@@ -1316,6 +1316,123 @@ fn exec_action(
         ActionKind::CallFunction { name } => {
             push(format!("Call {name}"));
         }
+        ActionKind::WriteJson { file, query, value } => {
+            // Pure data processing: runs in both modes.
+            let file = eval::expand_text(file, vars);
+            let query = eval::expand_text(query, vars);
+            let value = eval::eval_value(value, vars);
+            let resolved = resolve_script_path(&file, env.script_dir);
+            let mut root: serde_json::Value = std::fs::read_to_string(&resolved)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or(serde_json::Value::Object(Default::default()));
+            let typed: serde_json::Value = match value.parse::<i64>() {
+                Ok(n) => serde_json::Value::from(n),
+                Err(_) => match value.parse::<f64>() {
+                    Ok(n) => serde_json::Value::from(n),
+                    Err(_) => match value.to_ascii_lowercase().as_str() {
+                        "true" => serde_json::Value::Bool(true),
+                        "false" => serde_json::Value::Bool(false),
+                        _ => serde_json::Value::from(value.clone()),
+                    },
+                },
+            };
+            let segs: Vec<&str> = query.split('.').filter(|s| !s.is_empty()).collect();
+            if segs.is_empty() {
+                push(format!("Write JSON empty path: {file}"));
+            } else {
+                json_set_at(&mut root, &segs, typed);
+                match serde_json::to_string_pretty(&root)
+                    .map_err(|e| e.to_string())
+                    .and_then(|s| std::fs::write(&resolved, s).map_err(|e| e.to_string()))
+                {
+                    Ok(()) => push(format!("Write JSON {file} :: {query}")),
+                    Err(e) => push(format!("Write JSON failed: {e}")),
+                }
+            }
+        }
+        ActionKind::ReadRegistry { path, value, name } => {
+            let path = eval::expand_text(path, vars);
+            let value = eval::expand_text(value, vars);
+            if live {
+                match reg_read_string(&path, &value) {
+                    Some(data) => {
+                        vars.insert(name.clone(), data.clone());
+                        push(format!("Read Registry {name} <- {path}\\{value}"));
+                    }
+                    None => push(format!("Read Registry failed: {path}\\{value}")),
+                }
+            } else {
+                push(format!(
+                    "Read Registry {name} <- {path}\\{value} logic-skip"
+                ));
+            }
+        }
+        ActionKind::WriteRegistry { path, value, data } => {
+            let path = eval::expand_text(path, vars);
+            let value = eval::expand_text(value, vars);
+            let data = eval::eval_value(data, vars);
+            if live {
+                let ok = reg_write_string(&path, &value, &data);
+                push(format!(
+                    "Write Registry {path}\\{value}: {}",
+                    if ok { "ok" } else { "failed" }
+                ));
+            } else {
+                push(format!("Write Registry {path}\\{value} logic-skip"));
+            }
+        }
+        ActionKind::MinimizeWindow { title } => {
+            let title = eval::expand_text(title, vars);
+            if live {
+                let ok = window_style_command(&title, 3); // action 3 = minimize
+                push(format!(
+                    "Minimize `{title}`: {}",
+                    if ok { "ok" } else { "not found" }
+                ));
+            }
+        }
+        ActionKind::MaximizeWindow { title } => {
+            let title = eval::expand_text(title, vars);
+            if live {
+                let ok = window_style_command(&title, 4); // action 4 = maximize
+                push(format!(
+                    "Maximize `{title}`: {}",
+                    if ok { "ok" } else { "not found" }
+                ));
+            }
+        }
+        ActionKind::RestoreWindow { title } => {
+            let title = eval::expand_text(title, vars);
+            if live {
+                let ok = window_style_command(&title, 5); // action 5 = restore
+                push(format!(
+                    "Restore `{title}`: {}",
+                    if ok { "ok" } else { "not found" }
+                ));
+            }
+        }
+        ActionKind::SetClipboardHtml { html } => {
+            let html = eval::expand_text(html, vars);
+            let shown: String = html.chars().take(40).collect();
+            push(format!("Set Clipboard HTML \"{shown}\""));
+            if live && !crate::clipboard::set_html(&html) {
+                push("Set Clipboard HTML failed".into());
+            }
+        }
+        ActionKind::GetClipboardHtml { name } => {
+            if live {
+                match crate::clipboard::get_html() {
+                    Some(html) => {
+                        vars.insert(name.clone(), html);
+                        push(format!("Get Clipboard HTML -> {name}"));
+                    }
+                    None => push(format!("Get Clipboard HTML failed ({name})")),
+                }
+            } else {
+                push(format!("Get Clipboard HTML {name} logic-skip"));
+            }
+        }
         ActionKind::PlayScript { path } => {
             let path = eval::expand_text(path, vars);
             push(format!("Play script {path}"));
@@ -1717,6 +1834,11 @@ fn next_draw() -> u64 {
     z ^ (z >> 31)
 }
 
+/// Inclusive random range for `RAND(lo, hi)` expressions and `RandomNumber`.
+pub fn rand_range(lo: i64, hi: i64) -> i64 {
+    random_in_range(lo, hi, next_draw())
+}
+
 fn title_matches(window: &str, query: &str) -> bool {
     let query = query.trim();
     if query.is_empty() {
@@ -1760,7 +1882,8 @@ fn window_exists(query: &str) -> bool {
 #[cfg(windows)]
 struct WinHit {
     query: String,
-    /// 0 = find only, 1 = activate, 2 = close.
+    /// 0 = find only, 1 = activate, 2 = close, 3 = minimize, 4 = maximize,
+    /// 5 = restore.
     action: u8,
     found: bool,
 }
@@ -1776,6 +1899,20 @@ fn window_action(query: &str, action: u8) -> bool {
         EnumWindows(enum_top_window, &mut hit as *mut WinHit as isize);
     }
     hit.found
+}
+
+/// Show-style window command, matching the `window_action` codes
+/// (3 = minimize, 4 = maximize, 5 = restore).
+fn window_style_command(query: &str, action: u8) -> bool {
+    #[cfg(windows)]
+    {
+        window_action(query, action)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (query, action);
+        false
+    }
 }
 
 #[cfg(windows)]
@@ -1800,9 +1937,20 @@ unsafe extern "system" fn enum_top_window(hwnd: *mut core::ffi::c_void, lp: isiz
         hit.found = true;
         match hit.action {
             0 => return 0,
-            1 => bring_to_front(hwnd),
-            _ => {
+            1 => {
+                bring_to_front(hwnd);
+            }
+            2 => {
                 PostMessageW(hwnd, 0x0010, 0, 0);
+            }
+            3 => {
+                ShowWindow(hwnd, 6); // SW_MINIMIZE
+            }
+            4 => {
+                ShowWindow(hwnd, 3); // SW_MAXIMIZE
+            }
+            _ => {
+                ShowWindow(hwnd, 9); // SW_RESTORE
             }
         }
     }
@@ -1871,6 +2019,223 @@ fn open_path(path: &str) {
     {
         let _ = Command::new("xdg-open").arg(path).spawn();
     }
+}
+
+/// Set `value` at a dot path (`a.b.0.c`), creating intermediate objects and
+/// arrays. A numeric segment addresses an array index and reshapes the node.
+fn json_set_at(root: &mut serde_json::Value, segs: &[&str], value: serde_json::Value) {
+    if segs.is_empty() {
+        *root = value;
+        return;
+    }
+    let seg = segs[0];
+    if let Ok(idx) = seg.parse::<usize>() {
+        if !root.is_array() {
+            *root = serde_json::Value::Array(Vec::new());
+        }
+        let arr = root.as_array_mut().expect("just made an array");
+        while arr.len() <= idx {
+            arr.push(serde_json::Value::Null);
+        }
+        json_set_at(&mut arr[idx], &segs[1..], value);
+    } else {
+        if !root.is_object() {
+            *root = serde_json::Value::Object(Default::default());
+        }
+        let obj = root.as_object_mut().expect("just made an object");
+        let entry = obj
+            .entry(seg.to_string())
+            .or_insert(serde_json::Value::Null);
+        json_set_at(entry, &segs[1..], value);
+    }
+}
+
+#[cfg(windows)]
+mod registry {
+    const HKEY_CURRENT_USER: usize = 0x8000_0001;
+    const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
+    const KEY_READ: u32 = 0x0002_0019;
+    const KEY_WRITE: u32 = 0x0002_0006;
+    const REG_SZ: u32 = 1;
+
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn RegOpenKeyExW(
+            key: usize,
+            sub: *const u16,
+            options: u32,
+            access: u32,
+            result: *mut usize,
+        ) -> i32;
+        fn RegCreateKeyExW(
+            key: usize,
+            sub: *const u16,
+            reserved: u32,
+            class: *const u16,
+            options: u32,
+            access: u32,
+            security: *mut core::ffi::c_void,
+            result: *mut usize,
+            disposition: *mut u32,
+        ) -> i32;
+        fn RegQueryValueExW(
+            key: usize,
+            name: *const u16,
+            reserved: *mut u32,
+            kind: *mut u32,
+            data: *mut u8,
+            size: *mut u32,
+        ) -> i32;
+        fn RegSetValueExW(
+            key: usize,
+            name: *const u16,
+            reserved: u32,
+            kind: u32,
+            data: *const u8,
+            size: u32,
+        ) -> i32;
+        // Test cleanup only; the allow keeps the plain build warning-free.
+        #[cfg(test)]
+        #[allow(dead_code)]
+        fn RegDeleteTreeW(key: usize, sub: *const u16) -> i32;
+        fn RegCloseKey(key: usize) -> i32;
+    }
+
+    /// `HKCU\Software\...` (or HKLM) -> (root key handle, subkey text).
+    pub fn parse_path(path: &str) -> Option<(usize, String)> {
+        let is_sep = |c: char| c == '\\' || c == '/';
+        let path = path.trim().trim_matches(is_sep);
+        let (root, sub) = path.split_once(is_sep)?;
+        let root = match root.to_ascii_uppercase().as_str() {
+            "HKCU" | "HKEY_CURRENT_USER" => HKEY_CURRENT_USER,
+            "HKLM" | "HKEY_LOCAL_MACHINE" => HKEY_LOCAL_MACHINE,
+            _ => return None,
+        };
+        let sub = sub.trim_matches(is_sep);
+        if sub.is_empty() {
+            return None;
+        }
+        Some((root, sub.to_string()))
+    }
+
+    pub fn read(path: &str, value: &str) -> Option<String> {
+        let (root, sub) = parse_path(path)?;
+        let wide = to_wide(&sub);
+        let name = to_wide(value);
+        let mut key = 0usize;
+        unsafe {
+            if RegOpenKeyExW(root, wide.as_ptr(), 0, KEY_READ, &mut key) != 0 {
+                return None;
+            }
+            let mut kind = 0u32;
+            let mut size = 0u32;
+            let status = RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            );
+            if status != 0 || kind != REG_SZ || size == 0 || size > 1 << 16 {
+                RegCloseKey(key);
+                return None;
+            }
+            let mut buf = vec![0u8; size as usize];
+            let status = RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                buf.as_mut_ptr(),
+                &mut size,
+            );
+            RegCloseKey(key);
+            if status != 0 {
+                return None;
+            }
+            // REG_SZ data is UTF-16LE.
+            let mut wide = Vec::with_capacity(buf.len() / 2);
+            for pair in buf.chunks_exact(2) {
+                wide.push(u16::from_le_bytes([pair[0], pair[1]]));
+            }
+            while wide.last() == Some(&0) {
+                wide.pop();
+            }
+            Some(String::from_utf16_lossy(&wide))
+        }
+    }
+
+    pub fn write(path: &str, value: &str, data: &str) -> bool {
+        let Some((root, sub)) = parse_path(path) else {
+            return false;
+        };
+        let wide = to_wide(&sub);
+        let name = to_wide(value);
+        let mut payload: Vec<u8> = data.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+        payload.extend_from_slice(&[0, 0]);
+        let mut key = 0usize;
+        let mut disposition = 0u32;
+        unsafe {
+            let ok = RegCreateKeyExW(
+                root,
+                wide.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_WRITE,
+                std::ptr::null_mut(),
+                &mut key,
+                &mut disposition,
+            ) == 0
+                && RegSetValueExW(
+                    key,
+                    name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    payload.as_ptr(),
+                    payload.len() as u32,
+                ) == 0;
+            RegCloseKey(key);
+            ok
+        }
+    }
+
+    /// Test cleanup only.
+    #[cfg(test)]
+    pub fn delete_tree(path: &str) -> bool {
+        let Some((root, sub)) = parse_path(path) else {
+            return false;
+        };
+        let wide = to_wide(&sub);
+        unsafe { RegDeleteTreeW(root, wide.as_ptr()) == 0 }
+    }
+
+    fn to_wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+
+/// Read a registry string value (`REG_SZ`) like `HKCU\Software\Name`.
+#[cfg(windows)]
+fn reg_read_string(path: &str, value: &str) -> Option<String> {
+    registry::read(path, value)
+}
+
+#[cfg(not(windows))]
+fn reg_read_string(_path: &str, _value: &str) -> Option<String> {
+    None
+}
+
+/// Write a registry string value (`REG_SZ`), creating the key when missing.
+#[cfg(windows)]
+fn reg_write_string(path: &str, value: &str, data: &str) -> bool {
+    registry::write(path, value, data)
+}
+
+#[cfg(not(windows))]
+fn reg_write_string(_path: &str, _value: &str, _data: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -2204,6 +2569,94 @@ mod tests {
         let ry: i32 = r.vars.get("ry").unwrap().parse().unwrap();
         assert!((10..=30).contains(&rx), "{rx}");
         assert!((20..=40).contains(&ry), "{ry}");
+    }
+
+    #[test]
+    fn write_json_creates_and_updates_values_at_dot_paths() {
+        let path = std::env::temp_dir().join(format!("amk_write_json_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let sc = kinds(vec![
+            ActionKind::WriteJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "user.name".into(),
+                value: "Ada".into(),
+            },
+            ActionKind::WriteJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "user.scores.1".into(),
+                value: "42".into(),
+            },
+            ActionKind::WriteJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "user.scores.0".into(),
+                value: "7".into(),
+            },
+            ActionKind::WriteJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "user.active".into(),
+                value: "true".into(),
+            },
+            // A numeric segment reshapes an object into an array.
+            ActionKind::WriteJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "user.name.0".into(),
+                value: "first".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        assert!(r.ok, "{:?}", r.logs);
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["user"]["scores"], serde_json::json!([7, 42]));
+        assert_eq!(v["user"]["active"], serde_json::json!(true));
+        assert_eq!(v["user"]["name"], serde_json::json!(["first"]));
+    }
+
+    #[test]
+    fn read_json_picks_up_what_write_json_saved() {
+        let path = std::env::temp_dir().join(format!("amk_rw_json_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let sc = kinds(vec![
+            ActionKind::WriteJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "token".into(),
+                value: "{secret}9".into(),
+            },
+            ActionKind::ReadJson {
+                file: path.to_string_lossy().into_owned(),
+                query: "token".into(),
+                name: "back".into(),
+            },
+        ]);
+        let r = run_logic(&sc);
+        let _ = std::fs::remove_file(&path);
+        assert!(r.ok, "{:?}", r.logs);
+        // "{secret}" is not a known variable, so it stays literal in the file.
+        assert_eq!(r.vars.get("back").map(String::as_str), Some("{secret}9"));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn registry_write_then_read_roundtrips() {
+        use crate::engine::registry;
+        let base = format!(r"HKCU\Software\AMKTest\{}", std::process::id());
+        assert!(registry::write(&base, "Greeting", "hello world"));
+        let got = registry::read(&base, "Greeting");
+        assert!(registry::delete_tree(&base), "cleanup failed");
+        assert_eq!(got.as_deref(), Some("hello world"));
+        assert_eq!(registry::read(&base, "Greeting"), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn registry_parse_path_accepts_short_and_long_roots() {
+        use crate::engine::registry;
+        let (root, sub) = registry::parse_path(r"HKCU\Software\AMK").unwrap();
+        assert_eq!(sub, r"Software\AMK");
+        let _ = root;
+        assert!(registry::parse_path(r"HKCU\").is_none());
+        assert!(registry::parse_path(r"HKCR\Software\X").is_none());
     }
 
     #[test]

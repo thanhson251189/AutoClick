@@ -4,8 +4,9 @@ Ghi / chạy chuột-phím, Smart Click tìm ảnh, luồng If/For/While/Goto.
 Giao diện Anh / Việt. Windows.
 
 Theo chuẩn RobotSoft AMK cho phần ghi/chạy/lập trình kịch bản
-(đã có cả biên dịch EXE nhúng kịch bản). Chưa có: OCR, driver-level,
-background window, Invoke DLL/COM, ….
+(đã có cả biên dịch EXE nhúng kịch bản, hàm biểu thức, JSON hai chiều,
+Registry, clipboard HTML). Chưa có: OCR, driver-level, background window,
+Invoke DLL/COM, ….
 
 BUILD
 -----
@@ -55,6 +56,15 @@ Random Mouse     chọn điểm ngẫu nhiên trong hình chữ nhật, rê chu�
                  lưu tọa độ vào 2 biến (rnd_x / rnd_y).
 Chờ clipboard    Wait Clipboard: dừng tới khi nội dung clipboard khác
                  ban đầu (timeout + on_fail), lưu vào biến.
+Hàm biểu thức    Trong giá trị và điều kiện dùng được hàm (không phân biệt
+                 hoa thường):
+                 Chuỗi:   LEN UPPER LOWER TRIM MID LEFT RIGHT REPLACE
+                          INSTR VAL STR ASC CHR
+                 Số học:  ABS SQRT CEIL FLOOR ROUND POW MOD MIN MAX RAND
+                 Ngày giờ: NOW TODAY YEAR MONTH DAY HOUR MINUTE SECOND
+                          WEEKDAY TICKS
+                 Hệ thống: FILE_EXISTS FILE_SIZE FILE_READ FILE_WRITE ENV CLIP
+                 Ví dụ: If: LEN({name}) > 3   ·  Gán biến: UPPER({s})
 Play Random      chạy ngẫu nhiên 1 file .amk trong thư mục.
 Read JSON        đọc giá trị từ tệp JSON theo đường dẫn a.b.0.c vào biến.
 Key Down/Up      giữ phím / nhả phím — ghép lại thành bấm-giữ bao lâu cũng được.
@@ -62,6 +72,14 @@ Clipboard        Set Clipboard ghi text (có {biến}) vào clipboard;
                  Get Clipboard đọc clipboard vào một biến.
 Chờ cửa sổ       Wait Window: dừng tới khi tiêu đề cửa sổ xuất hiện
                  (timeout + on_fail: stop/skip).
+Ghi JSON         Write JSON: ghi giá trị vào tệp JSON theo đường dẫn a.b.0.c
+                 (tệp chưa có sẽ được tạo).
+Registry         Đọc/Ghi giá trị kiểu chữ trong Registry
+                 (đường dẫn HKCU\... hoặc HKLM\...).
+HTML clipboard   Set/Get Clipboard HTML: ghi/đọc HTML định dạng
+                 (Windows "HTML Format") — dán ra giữ định dạng.
+Đổi tên biến     Công cụ > Đổi tên biến: đổi chỗ gán, chỗ dùng {tên}, và cả
+                 từ nguyên vẹn trong biểu thức If/While/Switch.
 Move duration    Mouse Move có "Thời gian (ms)": 0 = nhảy tức thì,
                  > 0 = rê chuột mượt tới đích như AMK.
 Biến             Gán biến: giá trị, tên biến, {tên}, hoặc n + 1 (+ - * /).
@@ -73,8 +91,8 @@ Play Script      tải và chạy file .amk khác, dùng chung biến
 Chờ đến giờ      đúng phút đó thì chạy tiếp. Đang trong phút đó thì không chờ.
                  Phút đã qua thì bỏ qua, không chờ sang ngày hôm sau.
 Số ngẫu nhiên    nằm trong khoảng hai đầu, kể cả hai đầu
-Cửa sổ           Activate / Close / Wait theo một phần tiêu đề
-                 (không phân biệt hoa thường)
+Cửa sổ           Activate / Close / Wait / Thu nhỏ / Phóng to / Khôi phục
+                 theo một phần tiêu đề (không phân biệt hoa thường)
 Lịch             Tools → Scheduled Tasks. Chạy đúng HH:MM khi app còn mở
                  (một lần mỗi ngày cho mỗi tác vụ)
 Nhớ             Ngôn ngữ, phím tắt, tốc độ, cách lặp và lịch được lưu khi thoát

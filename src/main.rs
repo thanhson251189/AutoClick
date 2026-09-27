@@ -160,12 +160,14 @@ fn apply_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
     style.visuals = egui::Visuals::light();
     // Slightly above egui defaults: the dense action table reads better.
+    // Sub-12px Segoe turns mushy under egui's grayscale antialiasing, so the
+    // smallest styles stay at 12px or more.
     style.text_styles = [
         (egui::TextStyle::Heading, egui::FontId::proportional(19.0)),
         (egui::TextStyle::Body, egui::FontId::proportional(14.0)),
         (egui::TextStyle::Button, egui::FontId::proportional(14.0)),
-        (egui::TextStyle::Small, egui::FontId::proportional(11.0)),
-        (egui::TextStyle::Monospace, egui::FontId::monospace(13.0)),
+        (egui::TextStyle::Small, egui::FontId::proportional(12.0)),
+        (egui::TextStyle::Monospace, egui::FontId::monospace(14.0)),
     ]
     .into();
     let line = egui::Color32::from_rgb(226, 230, 235);
